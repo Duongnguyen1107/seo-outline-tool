@@ -1095,26 +1095,39 @@ def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
 
 def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
                         anthropic_key: str, location_code: int, serp_lang: str,
-                        use_jina: bool, t1: int, t2: int) -> dict:
-    """Run full pipeline for one keyword without any Streamlit calls. Returns result dict."""
+                        use_jina: bool, t1: int, t2: int,
+                        on_status=None) -> dict:
+    """Run full pipeline for one keyword. on_status(msg) called at each step."""
+    def _s(msg):
+        if on_status: on_status(msg)
+
     result = {"keyword": kw, "status": "error", "outline": None,
               "serp": [], "wc_stats": {}, "h2_stats": {}}
     try:
+        _s("🔍 Fetching SERP...")
         serp = fetch_serp(kw, dfs_login, dfs_password, location_code, serp_lang)
         if not serp:
             result["status"] = "no_serp"
             return result
         result["serp"] = serp
+        _s(f"🕷️ Crawling {len(serp)} competitor pages...")
 
         intent_hint  = detect_intent_from_modifier(kw)
         serp_intent  = intent_from_serp_titles(serp)
-        crawl        = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password)
-        wc_stats     = competitor_word_count_stats(crawl)
-        h2_stats     = competitor_h2_stats(crawl)
-        deduped      = dedup_and_weight_headings(crawl)
+
+        crawled = [0]
+        def _on_crawl(done, total, r):
+            crawled[0] = done
+            _s(f"🕷️ Crawling {done}/{total} pages...")
+
+        crawl    = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
+        wc_stats = competitor_word_count_stats(crawl)
+        h2_stats = competitor_h2_stats(crawl)
+        deduped  = dedup_and_weight_headings(crawl)
         result["wc_stats"] = wc_stats
         result["h2_stats"] = h2_stats
 
+        _s("🤖 AI generating outline...")
         prompt = build_prompt(kw, serp_lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
         raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key)
@@ -1126,6 +1139,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             return result
         result["outline"] = fix_outline_data(data)
         result["status"]  = "done"
+        _s("✅ Done")
     except Exception as e:
         result["status"] = f"error: {str(e)[:100]}"
     return result
@@ -1606,15 +1620,24 @@ with tab_bulk:
         results = list(st.session_state.bulk_results)
         start_idx = len(results)
 
+        step_slot = st.empty()
+
         for i in range(start_idx, n):
             kw_b = kws[i]
-            status_slot.info(f"🔄 [{i+1}/{n}] **{kw_b}** — SERP → Crawl → AI...")
+            status_slot.info(f"🔄 Keyword [{i+1}/{n}]: **{kw_b}**")
+
+            def _on_status(msg, _kw=kw_b, _i=i):
+                step_slot.caption(f"⏱️ {_kw}: {msg}")
+
             r = run_single_for_bulk(
                 kw_b, dfs_login, dfs_password, anthropic_key,
                 location_code, serp_lang, use_jina, t1, t2,
+                on_status=_on_status,
             )
             results.append(r)
             st.session_state.bulk_results = results
+            icon = "✅" if r["status"] == "done" else "❌"
+            step_slot.caption(f"{icon} **{kw_b}** — {r['status']}")
             prog.progress((i + 1) / n)
 
         st.session_state.bulk_running = False
