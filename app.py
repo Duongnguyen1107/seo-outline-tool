@@ -11,6 +11,9 @@ import httpx
 import json
 import re
 import time
+import os
+import io
+import csv
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import median
@@ -1030,6 +1033,59 @@ def outline_to_text(keyword: str, data: dict, wc_stats: dict) -> str:
         lines.append("")
     return "\n".join(lines)
 
+def _kw_to_slug(kw: str) -> str:
+    slug = re.sub(r"[^a-z0-9\s-]", "", kw.lower())
+    return re.sub(r"\s+", "-", slug.strip())[:60]
+
+def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list) -> str:
+    """Convert outline JSON to ZimmWriter Bulk SEO CSV format (Sheet1 layout)."""
+    # ARTICLE TITLE — dùng H1
+    title = data.get("h1") or keyword
+
+    # OUTLINE FOCUS — intent + unique angles
+    intent = data.get("search_intent_confirmed", "")
+    angles = data.get("unique_angles", [])
+    focus_parts = [p for p in [intent] + angles[:3] if p]
+    outline_focus = ". ".join(focus_parts)
+
+    # BACKGROUND — top 3 URL competitor (mỗi URL 1 dòng)
+    urls = [r["url"] for r in (serp_results or []) if r.get("url")][:3]
+    background = "\n".join(urls)
+
+    # OUTLINE — H2 dòng thường, H3 thêm "- " ở đầu
+    lines = []
+    for block in data.get("outline", []):
+        h2 = (block.get("h2") or "").strip()
+        if h2:
+            lines.append(h2)
+        for h3 in (block.get("h3s") or []):
+            if h3.strip():
+                lines.append(f"- {h3.strip()}")
+    outline_text = "\n".join(lines)
+
+    # SLUG — từ keyword
+    slug = _kw_to_slug(keyword)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow([
+        "ARTICLE TITLE", "OUTLINE FOCUS", "BACKGROUND",
+        "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
+    ])
+    writer.writerow([title, outline_focus, background, outline_text, "", "", slug])
+    return buf.getvalue()
+
+def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
+    """Save CSV to output/ folder next to app.py. Returns filepath."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir  = os.path.join(base_dir, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"zimmwriter_{_kw_to_slug(keyword)}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    filepath = os.path.join(out_dir, filename)
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        f.write(csv_content)
+    return filepath
+
 def run_ai_and_validate(system, prompt, key, stream_slot):
     raw = ""
     try:
@@ -1419,6 +1475,31 @@ if st.session_state.outline and not st.session_state.running:
 
     with st.expander("🔧 Raw JSON"):
         st.json(export_data)
+
+    # ── ZimmWriter CSV Export ─────────────────────────────────────
+    st.divider()
+    st.markdown("**📊 Export ZimmWriter CSV**")
+    zimm_csv = outline_to_zimmwriter_csv(kw, export_data, st.session_state.serp or [])
+    zc1, zc2 = st.columns([1, 1])
+    with zc1:
+        if st.button("💾 Lưu vào output/", use_container_width=True,
+                     help="Lưu file CSV vào thư mục output/ trong project"):
+            try:
+                fp = save_zimmwriter_to_disk(kw, zimm_csv)
+                st.success(f"✅ Đã lưu: `{fp}`")
+            except Exception as e:
+                st.error(f"Lỗi khi lưu: {e}")
+    with zc2:
+        st.download_button(
+            "⬇️ Download ZimmWriter CSV",
+            data=zimm_csv,
+            file_name=f"zimmwriter_{_kw_to_slug(kw)}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Download CSV để import vào ZimmWriter Bulk Writer",
+        )
+    with st.expander("👁️ Preview ZimmWriter CSV"):
+        st.code(zimm_csv, language=None)
 
 # Landing
 elif not st.session_state.outline:
