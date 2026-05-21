@@ -1110,9 +1110,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             result["status"] = "no_serp"
             return result
         result["serp"] = serp
-        # Bulk mode: chỉ crawl top 5 để tiết kiệm thời gian (~50% nhanh hơn)
-        serp_bulk = serp[:5]
-        _s(f"🕷️ Crawling top {len(serp_bulk)} pages (bulk fast mode)...")
+        _s(f"🕷️ Crawling top {len(serp)} pages...")
 
         intent_hint  = detect_intent_from_modifier(kw)
         serp_intent  = intent_from_serp_titles(serp)
@@ -1120,7 +1118,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         def _on_crawl(done, total, r):
             _s(f"🕷️ Crawling {done}/{total} pages...")
 
-        crawl    = crawl_all(serp_bulk, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
+        crawl    = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
         wc_stats = competitor_word_count_stats(crawl)
         h2_stats = competitor_h2_stats(crawl)
         deduped  = dedup_and_weight_headings(crawl)
@@ -1143,6 +1141,30 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
     except Exception as e:
         result["status"] = f"error: {str(e)[:100]}"
     return result
+
+def run_batch_parallel(kws_batch: list, dfs_login: str, dfs_password: str,
+                       anthropic_key: str, location_code: int, serp_lang: str,
+                       use_jina: bool, t1: int, t2: int) -> list:
+    """Run a batch of keywords in parallel threads. Returns results in original order."""
+    results = [None] * len(kws_batch)
+    with ThreadPoolExecutor(max_workers=len(kws_batch)) as ex:
+        fmap = {
+            ex.submit(
+                run_single_for_bulk, kw, dfs_login, dfs_password,
+                anthropic_key, location_code, serp_lang, use_jina, t1, t2,
+            ): i
+            for i, kw in enumerate(kws_batch)
+        }
+        for f in as_completed(fmap):
+            i = fmap[f]
+            try:
+                results[i] = f.result()
+            except Exception as e:
+                results[i] = {
+                    "keyword": kws_batch[i], "status": f"error: {str(e)[:80]}",
+                    "outline": None, "serp": [], "wc_stats": {}, "h2_stats": {},
+                }
+    return results
 
 def run_ai_and_validate(system, prompt, key, stream_slot):
     raw = ""
@@ -1185,7 +1207,7 @@ SESS_DEFAULTS = {
     "detected_lang":None,"intent_hint":None,"deduped":None,"serp_intent":None,
     "kw_history":[],"running":False,"edit_mode":False,
     # bulk
-    "bulk_running":False,"bulk_keywords":[],"bulk_results":[],
+    "bulk_running":False,"bulk_keywords":[],"bulk_results":[],"bulk_batch_size":3,
 }
 for k,v in SESS_DEFAULTS.items():
     if k not in st.session_state: st.session_state[k]=v
@@ -1587,61 +1609,95 @@ with tab_bulk:
         disabled=st.session_state.bulk_running,
     )
 
-    bc1, bc2 = st.columns([2, 4])
-    with bc1:
+    bs_col, btn_col, info_col = st.columns([2, 2, 4])
+    with bs_col:
+        batch_size = st.select_slider(
+            "⚡ Parallel batch",
+            options=[1, 2, 3, 5],
+            value=st.session_state.bulk_batch_size,
+            disabled=st.session_state.bulk_running,
+            help="Số keywords chạy song song cùng lúc. Batch 3 = ~3x nhanh hơn.",
+        )
+    with btn_col:
         bulk_run_btn = st.button(
             "🚀 Run Bulk", type="primary", use_container_width=True,
             disabled=st.session_state.bulk_running,
         )
-    with bc2:
+    with info_col:
         if st.session_state.bulk_running:
             st.info("⏳ Đang xử lý... vui lòng chờ")
+        else:
+            kws_preview = [k.strip() for k in bulk_input.splitlines() if k.strip()]
+            if kws_preview:
+                n_batches = -(-len(kws_preview) // batch_size)  # ceiling division
+                st.caption(f"📊 {len(kws_preview)} keywords · {n_batches} batches · batch size {batch_size}")
 
     if bulk_run_btn and not st.session_state.bulk_running:
         kws = [k.strip() for k in bulk_input.splitlines() if k.strip()]
         errs = []
-        if not kws:              errs.append("Nhập ít nhất 1 keyword.")
-        if not dfs_login:        errs.append("DataForSEO login required.")
-        if not dfs_password:     errs.append("DataForSEO password required.")
-        if not anthropic_key:    errs.append("Anthropic API key required.")
+        if not kws:           errs.append("Nhập ít nhất 1 keyword.")
+        if not dfs_login:     errs.append("DataForSEO login required.")
+        if not dfs_password:  errs.append("DataForSEO password required.")
+        if not anthropic_key: errs.append("Anthropic API key required.")
         if errs:
             for e in errs: st.error(e)
         else:
-            st.session_state.bulk_keywords = kws
-            st.session_state.bulk_results  = []
-            st.session_state.bulk_running  = True
+            st.session_state.bulk_keywords   = kws
+            st.session_state.bulk_results    = []
+            st.session_state.bulk_running    = True
+            st.session_state.bulk_batch_size = batch_size
             st.rerun()
 
     if st.session_state.bulk_running:
-        kws   = st.session_state.bulk_keywords
-        n     = len(kws)
-        prog  = st.progress(0)
+        kws        = st.session_state.bulk_keywords
+        bs         = st.session_state.bulk_batch_size
+        n          = len(kws)
+        n_batches  = -(-n // bs)
+        prog       = st.progress(0)
         status_slot = st.empty()
-        results = list(st.session_state.bulk_results)
-        start_idx = len(results)
+        step_slot   = st.empty()
 
-        step_slot = st.empty()
+        results   = list(st.session_state.bulk_results)
+        done_so_far = len(results)
 
-        for i in range(start_idx, n):
-            kw_b = kws[i]
-            status_slot.info(f"🔄 Keyword [{i+1}/{n}]: **{kw_b}**")
+        # Chia keywords còn lại thành batches
+        remaining   = kws[done_so_far:]
+        batches     = [remaining[i:i+bs] for i in range(0, len(remaining), bs)]
+        batch_start = done_so_far // bs  # batch number đã xong
 
-            def _on_status(msg, _kw=kw_b, _i=i):
-                step_slot.caption(f"⏱️ {_kw}: {msg}")
+        for b_idx, batch in enumerate(batches):
+            batch_num  = batch_start + b_idx + 1
+            kw_labels  = " · ".join(f"**{k[:30]}**" for k in batch)
+            status_slot.info(f"🔄 Batch {batch_num}/{n_batches}: {kw_labels}")
 
-            r = run_single_for_bulk(
-                kw_b, dfs_login, dfs_password, anthropic_key,
-                location_code, serp_lang, use_jina, t1, t2,
-                on_status=_on_status,
-            )
-            results.append(r)
+            if bs == 1:
+                # Sequential với per-step status
+                def _on_status(msg, _kw=batch[0]):
+                    step_slot.caption(f"⏱️ {_kw}: {msg}")
+                batch_results = [run_single_for_bulk(
+                    batch[0], dfs_login, dfs_password, anthropic_key,
+                    location_code, serp_lang, use_jina, t1, t2,
+                    on_status=_on_status,
+                )]
+            else:
+                step_slot.caption(f"⏱️ Running {len(batch)} keywords in parallel...")
+                batch_results = run_batch_parallel(
+                    batch, dfs_login, dfs_password, anthropic_key,
+                    location_code, serp_lang, use_jina, t1, t2,
+                )
+
+            results.extend(batch_results)
             st.session_state.bulk_results = results
-            icon = "✅" if r["status"] == "done" else "❌"
-            step_slot.caption(f"{icon} **{kw_b}** — {r['status']}")
-            prog.progress((i + 1) / n)
+
+            done_in_batch = sum(1 for r in batch_results if r["status"] == "done")
+            fail_in_batch = len(batch_results) - done_in_batch
+            summary = f"✅ {done_in_batch} done" + (f" · ❌ {fail_in_batch} lỗi" if fail_in_batch else "")
+            step_slot.caption(f"Batch {batch_num}: {summary}")
+            prog.progress(len(results) / n)
 
         st.session_state.bulk_running = False
         status_slot.empty()
+        step_slot.empty()
         st.rerun()
 
     if st.session_state.bulk_results and not st.session_state.bulk_running:
