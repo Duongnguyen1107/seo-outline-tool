@@ -563,7 +563,7 @@ def competitor_h2_stats(crawl_results: list[dict]) -> dict:
         "median": med,
         "min": min(h2_counts),
         "max": max(h2_counts),
-        "target": max(avg, med),   # use higher of avg/median
+        "target": max(avg, med, 5),  # use higher of avg/median, minimum 5
         "counts": h2_counts,
     }
 
@@ -1110,17 +1110,17 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             result["status"] = "no_serp"
             return result
         result["serp"] = serp
-        _s(f"🕷️ Crawling {len(serp)} competitor pages...")
+        # Bulk mode: chỉ crawl top 5 để tiết kiệm thời gian (~50% nhanh hơn)
+        serp_bulk = serp[:5]
+        _s(f"🕷️ Crawling top {len(serp_bulk)} pages (bulk fast mode)...")
 
         intent_hint  = detect_intent_from_modifier(kw)
         serp_intent  = intent_from_serp_titles(serp)
 
-        crawled = [0]
         def _on_crawl(done, total, r):
-            crawled[0] = done
             _s(f"🕷️ Crawling {done}/{total} pages...")
 
-        crawl    = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
+        crawl    = crawl_all(serp_bulk, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
         wc_stats = competitor_word_count_stats(crawl)
         h2_stats = competitor_h2_stats(crawl)
         deduped  = dedup_and_weight_headings(crawl)
