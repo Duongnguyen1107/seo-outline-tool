@@ -601,7 +601,7 @@ def format_headings_for_prompt(deduped: list[dict], total_crawled: int) -> str:
 # ═══════════════════════════════════════════════════════════════════
 # JSON VALIDATION
 # ═══════════════════════════════════════════════════════════════════
-REQUIRED_FIELDS    = {"h1":str,"meta_description":str,"article_type":str,"outline":list,"faq":list}
+REQUIRED_FIELDS    = {"h1":str,"meta_description":str,"article_type":str,"outline":list}
 VALID_SOURCES      = {"competitor","ai","hybrid"}
 VALID_ARTICLE_TYPES= {"informational","listicle","how-to","comparison","review","commercial","transactional"}
 
@@ -628,10 +628,13 @@ def validate_outline(data: dict) -> list[str]:
                 item["source"]="ai"
             if not isinstance(item.get("h3s"),list):
                 item["h3s"]=[]
+            if not isinstance(item.get("bullets"),list):
+                item["bullets"]=[]
     return errors
 
 def fix_outline_data(data: dict) -> dict:
-    if not isinstance(data.get("faq"),list):          data["faq"]=[]
+    # Always clear FAQ
+    data["faq"] = []
     if not isinstance(data.get("unique_angles"),list): data["unique_angles"]=[]
     if data.get("article_type") not in VALID_ARTICLE_TYPES:
         data["article_type"]="informational"
@@ -639,6 +642,11 @@ def fix_outline_data(data: dict) -> dict:
         if isinstance(item,dict):
             if item.get("source") not in VALID_SOURCES: item["source"]="ai"
             if not isinstance(item.get("h3s"),list):    item["h3s"]=[]
+            if not isinstance(item.get("bullets"),list): item["bullets"]=[]
+            # If both h3s and bullets present, keep h3s and clear bullets
+            # (competitor had real H3s, bullets redundant)
+            if item.get("h3s") and item.get("bullets"):
+                item["bullets"]=[]
     return data
 
 # ═══════════════════════════════════════════════════════════════════
@@ -687,28 +695,52 @@ def parse_json_response(raw: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 # PROMPTS  — Feature #3: H2 count constraint
 # ═══════════════════════════════════════════════════════════════════
+CURRENT_YEAR = 2026  # Update annually
+
 SYSTEM_PROMPT = """Bạn là chuyên gia SEO content strategist. Tạo outline bài viết SEO tốt nhất.
 
-Nguyên tắc:
-- Ngôn ngữ output = ngôn ngữ của keyword
-- Heading đi kèm tần suất [X/N] — phổ biến = phải cover, hiếm = differentiation
-- Outline UNIQUE: paraphrase, không copy nguyên văn
-- Search intent đã detect 2 layers — dùng để định hình cấu trúc
-- Số H2 PHẢI gần với target_h2_count được cung cấp (±1 là chấp nhận được)
-- Output: JSON thuần túy, không markdown fence
+QUY TẮC QUAN TRỌNG:
+
+1. H2 TEXT:
+   - Heading [5+/N competitors]: GIỮ NGUYÊN text từ đối thủ (không rewrite, không paraphrase).
+     Lý do: nếu nhiều trang top rank cùng dùng 1 heading → đó là heading tốt nhất cho SEO.
+   - Heading [3-4/N]: có thể paraphrase nhẹ
+   - Heading [1-2/N] hoặc AI-generated: viết mới hoàn toàn
+   - source="competitor" khi lấy từ đối thủ, source="ai" khi tự tạo, source="hybrid" khi kết hợp
+
+2. H3:
+   - CHỈ đưa vào h3s[] nếu đối thủ thực sự có H3 dưới H2 đó trong data crawl
+   - Nếu đối thủ KHÔNG có H3 → để h3s=[] và dùng "bullets" để gợi ý nội dung viết gì
+   - bullets là gợi ý ngắn (3-6 từ) về điểm cần cover trong section đó
+   - Không được bịa H3 khi đối thủ không có
+
+3. FAQ: KHÔNG tạo FAQ. Để faq=[] rỗng.
+
+4. NĂM THÁNG: Nếu keyword có năm cũ hoặc không có năm → dùng năm hiện tại trong H1/headings.
+   Không được dùng năm < {CURRENT_YEAR}.
+
+5. SỐ H2: generate đúng target_h2_count (±1).
+
+6. NGÔN NGỮ: output = ngôn ngữ của keyword.
 
 JSON schema (tất cả field bắt buộc):
-{
+{{
   "h1": "string",
   "meta_description": "string 150-160 chars",
   "article_type": "informational|listicle|how-to|comparison|review|commercial|transactional",
   "search_intent_confirmed": "string",
   "unique_angles": ["string"],
   "outline": [
-    {"h2":"string","source":"competitor|ai|hybrid","h3s":["string"],"note":"string (optional)"}
+    {{
+      "h2": "string — giữ nguyên nếu [5+/N], paraphrase nếu [3-4/N], viết mới nếu AI",
+      "source": "competitor|ai|hybrid",
+      "h3s": ["string — CHỈ có nếu đối thủ crawl được có H3 thực sự"],
+      "bullets": ["gợi ý nội dung ngắn nếu không có H3"],
+      "note": "string — ghi [X/N competitors] để biết tần suất"
+    }}
   ],
-  "faq": ["string"]
-}"""
+  "faq": []
+}}"""
 
 def build_prompt(keyword, lang, mod_intent, serp_intent, serp_results,
                  deduped, crawl_results, wc_stats, h2_stats) -> str:
@@ -725,22 +757,47 @@ def build_prompt(keyword, lang, mod_intent, serp_intent, serp_results,
     total_crawled = sum(1 for r in crawl_results if r.get("headings"))
     headings_block = format_headings_for_prompt(deduped, total_crawled)
 
+    # Build H3 context: which H2s actually have H3s from competitors
+    h2_h3_map: dict[str, list[str]] = {}
+    for r in crawl_results:
+        hs = r.get("headings") or []
+        cur_h2 = None
+        for h in hs:
+            if h["tag"] == "h2":
+                cur_h2 = h["text"]
+                if cur_h2 not in h2_h3_map:
+                    h2_h3_map[cur_h2] = []
+            elif h["tag"] == "h3" and cur_h2:
+                if h["text"] not in h2_h3_map[cur_h2]:
+                    h2_h3_map[cur_h2].append(h["text"])
+
+    h3_context = ""
+    if h2_h3_map:
+        h3_lines = []
+        for h2_text, h3_list in list(h2_h3_map.items())[:20]:  # cap at 20 H2s
+            if h3_list:
+                h3_lines.append(f"  H2: {h2_text}")
+                for h3 in h3_list[:6]:  # cap H3s per H2
+                    h3_lines.append(f"    → H3: {h3}")
+        if h3_lines:
+            h3_context = "\nH3 THỰC TẾ TỪ COMPETITORS (chỉ những H2 có H3):\n" + "\n".join(h3_lines) + "\n"
+
     wc_block = ""
     if wc_stats:
         wc_block = (f"Word count: competitor median={wc_stats['median']:,}, "
                     f"target=~{wc_stats['target']:,} words\n")
 
-    # Feature #3
     h2_block = ""
     if h2_stats:
         h2_block = (
             f"Competitor H2 count: avg={h2_stats['avg']}, "
             f"median={h2_stats['median']}, range={h2_stats['min']}–{h2_stats['max']}\n"
-            f"TARGET H2 COUNT = {h2_stats['target']} (generate this many H2 sections, ±1)\n"
+            f"TARGET H2 COUNT = {h2_stats['target']} (±1)\n"
         )
 
     return f"""Keyword: "{keyword}"
 Language: {lang}
+Current year: {CURRENT_YEAR} — dùng năm này trong H1 nếu keyword có năm hoặc cần cập nhật
 
 SEARCH INTENT (2-layer):
 - Modifier: {mod_str}
@@ -750,16 +807,20 @@ SERP TITLES:
 {titles_block}
 
 {wc_block}{h2_block}
-COMPETITOR HEADINGS (deduplicated, {total_crawled} pages):
+COMPETITOR HEADINGS (deduplicated, {total_crawled} pages crawled):
 {headings_block}
-
+{h3_context}
 Instructions:
 1. intent → search_intent_confirmed
-2. [5+/{total_crawled}] headings = must-cover (paraphrase)
-3. [1-2/{total_crawled}] headings = differentiation opportunities
-4. Add AI gaps competitors missed
-5. Generate EXACTLY {h2_stats.get('target','6-8') if h2_stats else '6-8'} H2 sections (±1)
-6. All text in {'Vietnamese' if lang=='vi' else 'English'}
+2. [5+/{total_crawled}] H2 headings: COPY NGUYÊN TEXT, source="competitor"
+3. [3-4/{total_crawled}] H2: paraphrase nhẹ, source="competitor"
+4. [1-2/{total_crawled}] H2: rewrite hoặc AI gap, source="hybrid"/"ai"
+5. H3: CHỈ điền nếu competitor thực sự có H3 đó (xem H3 THỰC TẾ bên trên)
+6. Nếu không có H3 từ competitor → dùng bullets (3-6 từ/bullet, 3-5 bullets)
+7. faq = [] (bỏ trống hoàn toàn)
+8. Generate EXACTLY {h2_stats.get('target','6-8') if h2_stats else '6-8'} H2 sections (±1)
+9. All text in {'Vietnamese' if lang=='vi' else 'English'}
+10. note = ghi "[X/{total_crawled} competitors]" cho mỗi H2
 
 Return pure JSON only."""
 
@@ -822,9 +883,39 @@ def render_outline_view(data: dict, wc_stats: dict):
         note = block.get("note","")
         nh   = (f'<span style="font-size:0.75rem;color:#94a3b8;font-weight:400"> — {note}</span>'
                 if note else "")
-        h3s  = "".join(f'<div class="h3-row"><span class="h3-arrow">↳</span>{h}</div>'
-                       for h in block.get("h3s",[]))
-        body = f'<div class="sec-body">{h3s}</div>' if h3s else ""
+
+        h3s     = block.get("h3s",[])
+        bullets = block.get("bullets",[])
+
+        # H3 rows — with frequency note if present in note field
+        h3_html = ""
+        if h3s:
+            h3_html = "".join(
+                f'<div class="h3-row">'
+                f'<span class="h3-arrow">↳</span>'
+                f'<span class="badge b-num" style="font-size:0.55rem;margin-right:4px">H3</span>'
+                f'{h}</div>'
+                for h in h3s
+            )
+
+        # Bullet rows — content guidance when no real H3s
+        bullet_html = ""
+        if bullets and not h3s:
+            bullet_html = (
+                '<div style="padding:4px 0 2px;font-size:0.72rem;color:#94a3b8;'
+                'font-weight:600;text-transform:uppercase;letter-spacing:.4px">'
+                '💡 Nội dung gợi ý</div>' +
+                "".join(
+                    f'<div class="h3-row" style="color:#64748b">'
+                    f'<span style="color:#cbd5e1;margin-right:6px;flex-shrink:0">•</span>'
+                    f'{b}</div>'
+                    for b in bullets
+                )
+            )
+
+        body_content = h3_html + bullet_html
+        body = f'<div class="sec-body">{body_content}</div>' if body_content else ""
+
         col_m, col_c = st.columns([11,1])
         with col_m:
             st.markdown(f"""<div class="sec {sc}">
@@ -833,15 +924,12 @@ def render_outline_view(data: dict, wc_stats: dict):
                 <span class="badge {bc}">{bt}</span>{nh}
               </div>{body}</div>""", unsafe_allow_html=True)
         with col_c:
-            txt = f"H2: {block['h2']}\n" + "\n".join(f"  H3: {h}" for h in block.get("h3s",[]))
-            st.download_button("📋", data=txt.strip(), file_name=f"h2_{idx+1}.txt",
+            lines = [f"H2: {block['h2']}"]
+            for h in h3s:   lines.append(f"  H3: {h}")
+            for b in bullets: lines.append(f"  • {b}")
+            st.download_button("📋", data="\n".join(lines),
+                               file_name=f"h2_{idx+1}.txt",
                                mime="text/plain", key=f"dl_h2_{idx}", help=f"H2 {idx+1}")
-    if faq:
-        faq_rows = "".join(f'<div class="h3-row"><span class="h3-arrow">Q</span>{q}</div>'
-                           for q in faq)
-        st.markdown(f"""<div class="sec sec-faq" style="margin-top:12px">
-          <div class="sec-head"><span class="badge b-faq">FAQ</span> FAQ</div>
-          <div class="sec-body">{faq_rows}</div></div>""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════
 # Feature #2: EDITABLE OUTLINE
@@ -849,7 +937,6 @@ def render_outline_view(data: dict, wc_stats: dict):
 def outline_to_df(data: dict) -> pd.DataFrame:
     """Convert outline JSON → flat DataFrame for st.data_editor."""
     rows = []
-    # H1 row
     rows.append({"Level":"H1","Text":data.get("h1",""),"Source":"—","Note":""})
     for block in data.get("outline",[]):
         src = block.get("source","ai").capitalize()
@@ -857,17 +944,15 @@ def outline_to_df(data: dict) -> pd.DataFrame:
                      "Note":block.get("note","")})
         for h3 in block.get("h3s",[]):
             rows.append({"Level":"H3","Text":h3,"Source":"","Note":""})
-    if data.get("faq"):
-        rows.append({"Level":"FAQ","Text":"── FAQ Section ──","Source":"","Note":""})
-        for q in data["faq"]:
-            rows.append({"Level":"FAQ-Q","Text":q,"Source":"","Note":""})
+        for b in block.get("bullets",[]):
+            rows.append({"Level":"Bullet","Text":b,"Source":"","Note":""})
     return pd.DataFrame(rows)
 
 def df_to_outline(df: pd.DataFrame, original: dict) -> dict:
     """Reconstruct outline JSON from edited DataFrame."""
     result = dict(original)
+    result["faq"] = []  # always empty
     h2_blocks: list[dict] = []
-    faq_items: list[str]  = []
     current_h2: dict | None = None
 
     for _, row in df.iterrows():
@@ -878,24 +963,22 @@ def df_to_outline(df: pd.DataFrame, original: dict) -> dict:
         if lvl == "H1":
             result["h1"] = text
         elif lvl == "H2":
-            if current_h2:
-                h2_blocks.append(current_h2)
+            if current_h2: h2_blocks.append(current_h2)
             src = (row.get("Source") or "ai").lower()
             if src not in VALID_SOURCES: src = "ai"
-            current_h2 = {"h2":text,"source":src,"h3s":[],
+            current_h2 = {"h2":text,"source":src,"h3s":[],"bullets":[],
                           "note":(row.get("Note") or "").strip()}
         elif lvl == "H3":
             if current_h2 is None:
-                current_h2 = {"h2":"(untitled)","source":"ai","h3s":[],"note":""}
+                current_h2 = {"h2":"(untitled)","source":"ai","h3s":[],"bullets":[],"note":""}
             current_h2["h3s"].append(text)
-        elif lvl == "FAQ-Q":
-            faq_items.append(text)
+        elif lvl == "Bullet":
+            if current_h2 is None:
+                current_h2 = {"h2":"(untitled)","source":"ai","h3s":[],"bullets":[],"note":""}
+            current_h2["bullets"].append(text)
 
-    if current_h2:
-        h2_blocks.append(current_h2)
-
+    if current_h2: h2_blocks.append(current_h2)
     result["outline"] = h2_blocks
-    result["faq"]     = faq_items
     return result
 
 def render_editor(data: dict, wc_stats: dict) -> dict:
@@ -904,8 +987,7 @@ def render_editor(data: dict, wc_stats: dict) -> dict:
     Returns possibly-modified outline dict.
     """
     st.markdown('<div class="edit-banner">✏️ <b>Edit mode</b> — click any cell to edit. '
-                'Add/delete rows with the row controls. '
-                'Level must be H1 / H2 / H3 / FAQ-Q.</div>',
+                'Add/delete rows. Level: H1 / H2 / H3 / Bullet</div>',
                 unsafe_allow_html=True)
 
     df = outline_to_df(data)
@@ -916,7 +998,7 @@ def render_editor(data: dict, wc_stats: dict) -> dict:
         num_rows="dynamic",
         column_config={
             "Level": st.column_config.SelectboxColumn(
-                "Level", options=["H1","H2","H3","FAQ","FAQ-Q"], width="small"
+                "Level", options=["H1","H2","H3","Bullet"], width="small"
             ),
             "Text":   st.column_config.TextColumn("Text",   width="large"),
             "Source": st.column_config.SelectboxColumn(
@@ -934,7 +1016,7 @@ def render_editor(data: dict, wc_stats: dict) -> dict:
 # EXPORT
 # ═══════════════════════════════════════════════════════════════════
 def outline_to_text(keyword: str, data: dict, wc_stats: dict) -> str:
-    lines = [f"OUTLINE: {keyword}",""]
+    lines = [f"OUTLINE: {keyword}", ""]
     if data.get("h1"):               lines.append(f"H1: {data['h1']}")
     if data.get("meta_description"): lines.append(f"Meta: {data['meta_description']}")
     if data.get("search_intent_confirmed"): lines.append(f"Intent: {data['search_intent_confirmed']}")
@@ -943,15 +1025,11 @@ def outline_to_text(keyword: str, data: dict, wc_stats: dict) -> str:
     lines.append("")
     for i,b in enumerate(data.get("outline",[]),1):
         lines.append(f"H2 {i}: {b['h2']}  [{b.get('source','ai')}]")
-        for h in b.get("h3s",[]): lines.append(f"   H3: {h}")
+        for h in b.get("h3s",[]):      lines.append(f"   H3: {h}")
+        for pt in b.get("bullets",[]): lines.append(f"   • {pt}")
         lines.append("")
-    if data.get("faq"):
-        lines += ["FAQ:"] + [f"  Q: {q}" for q in data["faq"]]
     return "\n".join(lines)
 
-# ═══════════════════════════════════════════════════════════════════
-# AI helper
-# ═══════════════════════════════════════════════════════════════════
 def run_ai_and_validate(system, prompt, key, stream_slot):
     raw = ""
     try:
