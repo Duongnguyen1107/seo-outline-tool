@@ -1037,22 +1037,20 @@ def _kw_to_slug(kw: str) -> str:
     slug = re.sub(r"[^a-z0-9\s-]", "", kw.lower())
     return re.sub(r"\s+", "-", slug.strip())[:60]
 
-def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list) -> str:
-    """Convert outline JSON to ZimmWriter Bulk SEO CSV format (Sheet1 layout)."""
-    # ARTICLE TITLE — dùng H1
-    title = data.get("h1") or keyword
+ZIMM_HEADERS = [
+    "ARTICLE TITLE", "OUTLINE FOCUS", "BACKGROUND",
+    "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
+]
 
-    # OUTLINE FOCUS — intent + unique angles
+def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list) -> list:
+    """Build one CSV data row from outline data."""
+    title = data.get("h1") or keyword
     intent = data.get("search_intent_confirmed", "")
     angles = data.get("unique_angles", [])
     focus_parts = [p for p in [intent] + angles[:3] if p]
     outline_focus = ". ".join(focus_parts)
-
-    # BACKGROUND — top 3 URL competitor (mỗi URL 1 dòng)
     urls = [r["url"] for r in (serp_results or []) if r.get("url")][:3]
     background = "\n".join(urls)
-
-    # OUTLINE — H2 dòng thường, H3 thêm "- " ở đầu
     lines = []
     for block in data.get("outline", []):
         h2 = (block.get("h2") or "").strip()
@@ -1062,17 +1060,26 @@ def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list) -> s
             if h3.strip():
                 lines.append(f"- {h3.strip()}")
     outline_text = "\n".join(lines)
-
-    # SLUG — từ keyword
     slug = _kw_to_slug(keyword)
+    return [title, outline_focus, background, outline_text, "", "", slug]
 
+def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list) -> str:
+    """Single-keyword ZimmWriter CSV."""
     buf = io.StringIO()
-    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
-    writer.writerow([
-        "ARTICLE TITLE", "OUTLINE FOCUS", "BACKGROUND",
-        "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
-    ])
-    writer.writerow([title, outline_focus, background, outline_text, "", "", slug])
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    w.writerow(ZIMM_HEADERS)
+    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results))
+    return buf.getvalue()
+
+def bulk_to_zimmwriter_csv(results: list) -> str:
+    """Multi-keyword ZimmWriter CSV — one row per successful keyword."""
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    w.writerow(ZIMM_HEADERS)
+    for r in results:
+        if r.get("status") != "done" or not r.get("outline"):
+            continue
+        w.writerow(_outline_to_zimmwriter_row(r["keyword"], r["outline"], r.get("serp", [])))
     return buf.getvalue()
 
 def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
@@ -1085,6 +1092,43 @@ def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
     with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
         f.write(csv_content)
     return filepath
+
+def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
+                        anthropic_key: str, location_code: int, serp_lang: str,
+                        use_jina: bool, t1: int, t2: int) -> dict:
+    """Run full pipeline for one keyword without any Streamlit calls. Returns result dict."""
+    result = {"keyword": kw, "status": "error", "outline": None,
+              "serp": [], "wc_stats": {}, "h2_stats": {}}
+    try:
+        serp = fetch_serp(kw, dfs_login, dfs_password, location_code, serp_lang)
+        if not serp:
+            result["status"] = "no_serp"
+            return result
+        result["serp"] = serp
+
+        intent_hint  = detect_intent_from_modifier(kw)
+        serp_intent  = intent_from_serp_titles(serp)
+        crawl        = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password)
+        wc_stats     = competitor_word_count_stats(crawl)
+        h2_stats     = competitor_h2_stats(crawl)
+        deduped      = dedup_and_weight_headings(crawl)
+        result["wc_stats"] = wc_stats
+        result["h2_stats"] = h2_stats
+
+        prompt = build_prompt(kw, serp_lang, intent_hint, serp_intent,
+                              serp, deduped, crawl, wc_stats, h2_stats)
+        raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key)
+        data   = parse_json_response(raw)
+        errors = validate_outline(data)
+        fatal  = [e for e in errors if "Missing" in e or "empty" in e]
+        if fatal:
+            result["status"] = "ai_error: " + "; ".join(fatal[:2])
+            return result
+        result["outline"] = fix_outline_data(data)
+        result["status"]  = "done"
+    except Exception as e:
+        result["status"] = f"error: {str(e)[:100]}"
+    return result
 
 def run_ai_and_validate(system, prompt, key, stream_slot):
     raw = ""
@@ -1126,6 +1170,8 @@ SESS_DEFAULTS = {
     "wc_stats":None,"h2_stats":None,"last_kw":None,
     "detected_lang":None,"intent_hint":None,"deduped":None,"serp_intent":None,
     "kw_history":[],"running":False,"edit_mode":False,
+    # bulk
+    "bulk_running":False,"bulk_keywords":[],"bulk_results":[],
 }
 for k,v in SESS_DEFAULTS.items():
     if k not in st.session_state: st.session_state[k]=v
@@ -1185,41 +1231,43 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════
 st.title("🧭 SEO Outline Generator")
 
-kw_col,btn_col,reg_col = st.columns([5,1.5,1.8])
-with kw_col:
-    keyword = st.text_input("kw", placeholder="e.g.  cách học tiếng anh  /  best project management tools",
-                             label_visibility="collapsed", disabled=st.session_state.running)
-with btn_col:
-    run_btn = st.button("🚀 Generate", type="primary", use_container_width=True,
-                        disabled=st.session_state.running)
-with reg_col:
-    regen_btn = st.button("🔄 New Outline", use_container_width=True,
-                          disabled=(not st.session_state.crawl) or st.session_state.running,
-                          help="Re-run AI — skips crawl")
+tab_single, tab_bulk = st.tabs(["🔍 Single Keyword", "📋 Bulk"])
 
-# Live detect preview
-if keyword and not st.session_state.running:
-    auto_lang   = detect_language(keyword)
-    eff_lang    = (auto_lang if lang_override=="Auto detect"
-                   else "vi" if "Vietnamese" in lang_override else "en")
-    lang_src    = "auto" if lang_override=="Auto detect" else "manual"
-    intent_hint = detect_intent_from_modifier(keyword)
-    il,ibg,icolor = INTENT_LABELS.get(intent_hint["intent"],INTENT_LABELS["mixed"])
-    flag = "🇻🇳" if eff_lang=="vi" else "🇬🇧"
-    cc   = {"high":"#16a34a","medium":"#d97706","low":"#94a3b8"}.get(intent_hint["confidence"],"#94a3b8")
-    sig  = ", ".join(intent_hint["signals"][:4]) or "—"
-    st.markdown(f"""
-    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-                margin:6px 0 14px;font-size:0.82rem;">
-      <span class="badge b-lang">{flag} {eff_lang.upper()} · {lang_src}</span>
-      <span class="badge" style="background:{ibg};color:{icolor}">{il}</span>
-      <span style="color:{cc};font-weight:600">{intent_hint['confidence']} confidence</span>
-      <span style="color:#94a3b8">signals: {sig}</span>
-    </div>""", unsafe_allow_html=True)
-else:
-    eff_lang    = serp_lang  # dùng ngôn ngữ của thị trường đã chọn làm fallback
-    intent_hint = {"intent":"informational","confidence":"low","signals":[]}
+# ── Tab Single ────────────────────────────────────────────────────
+with tab_single:
+    kw_col,btn_col,reg_col = st.columns([5,1.5,1.8])
+    with kw_col:
+        keyword = st.text_input("kw", placeholder="e.g.  cách học tiếng anh  /  best project management tools",
+                                label_visibility="collapsed", disabled=st.session_state.running)
+    with btn_col:
+        run_btn = st.button("🚀 Generate", type="primary", use_container_width=True,
+                            disabled=st.session_state.running)
+    with reg_col:
+        regen_btn = st.button("🔄 New Outline", use_container_width=True,
+                              disabled=(not st.session_state.crawl) or st.session_state.running,
+                              help="Re-run AI — skips crawl")
 
+    if keyword and not st.session_state.running:
+        auto_lang   = detect_language(keyword)
+        eff_lang    = (auto_lang if lang_override=="Auto detect"
+                       else "vi" if "Vietnamese" in lang_override else "en")
+        lang_src    = "auto" if lang_override=="Auto detect" else "manual"
+        intent_hint = detect_intent_from_modifier(keyword)
+        il,ibg,icolor = INTENT_LABELS.get(intent_hint["intent"],INTENT_LABELS["mixed"])
+        flag = "🇻🇳" if eff_lang=="vi" else "🇬🇧"
+        cc   = {"high":"#16a34a","medium":"#d97706","low":"#94a3b8"}.get(intent_hint["confidence"],"#94a3b8")
+        sig  = ", ".join(intent_hint["signals"][:4]) or "—"
+        st.markdown(f"""
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+                    margin:6px 0 14px;font-size:0.82rem;">
+          <span class="badge b-lang">{flag} {eff_lang.upper()} · {lang_src}</span>
+          <span class="badge" style="background:{ibg};color:{icolor}">{il}</span>
+          <span style="color:{cc};font-weight:600">{intent_hint['confidence']} confidence</span>
+          <span style="color:#94a3b8">signals: {sig}</span>
+        </div>""", unsafe_allow_html=True)
+    else:
+        eff_lang    = serp_lang
+        intent_hint = {"intent":"informational","confidence":"low","signals":[]}
 # ═══════════════════════════════════════════════════════════════════
 # PIPELINE: Full run
 # ═══════════════════════════════════════════════════════════════════
@@ -1513,12 +1561,113 @@ elif not st.session_state.outline:
       </div>
     </div>""", unsafe_allow_html=True)
 
-    st.markdown("""
-    **v6 — 3 new features:**
-    - 🟣 **Jina Reader fallback** — `r.jina.ai/URL` khi trang bị Cloudflare block.
-      Toggle trong sidebar. 0 API key cần thiết.
-    - ✏️ **Editable outline** — toggle "Edit outline" sau khi generate.
-      Sửa H1/H2/H3 trực tiếp trong bảng, preview real-time, rồi export.
-    - 📊 **Target H2 count** — tính avg + median H2 của competitor,
-      đưa vào prompt làm constraint cứng (±1). Outline nhất quán hơn.
-    """)
+# ── Tab Bulk ──────────────────────────────────────────────────────
+with tab_bulk:
+    st.markdown("### 📋 Bulk Keyword Processing")
+    st.caption("Mỗi keyword = 1 hàng trong file ZimmWriter CSV. Nhập API keys trong sidebar trước.")
+
+    bulk_input = st.text_area(
+        "Keywords (mỗi dòng 1 keyword)",
+        placeholder="what is a pergola\nbest pergola kits\nhow to build a pergola\npergola vs gazebo",
+        height=220,
+        disabled=st.session_state.bulk_running,
+    )
+
+    bc1, bc2 = st.columns([2, 4])
+    with bc1:
+        bulk_run_btn = st.button(
+            "🚀 Run Bulk", type="primary", use_container_width=True,
+            disabled=st.session_state.bulk_running,
+        )
+    with bc2:
+        if st.session_state.bulk_running:
+            st.info("⏳ Đang xử lý... vui lòng chờ")
+
+    if bulk_run_btn and not st.session_state.bulk_running:
+        kws = [k.strip() for k in bulk_input.splitlines() if k.strip()]
+        errs = []
+        if not kws:              errs.append("Nhập ít nhất 1 keyword.")
+        if not dfs_login:        errs.append("DataForSEO login required.")
+        if not dfs_password:     errs.append("DataForSEO password required.")
+        if not anthropic_key:    errs.append("Anthropic API key required.")
+        if errs:
+            for e in errs: st.error(e)
+        else:
+            st.session_state.bulk_keywords = kws
+            st.session_state.bulk_results  = []
+            st.session_state.bulk_running  = True
+            st.rerun()
+
+    if st.session_state.bulk_running:
+        kws   = st.session_state.bulk_keywords
+        n     = len(kws)
+        prog  = st.progress(0)
+        status_slot = st.empty()
+        results = list(st.session_state.bulk_results)
+        start_idx = len(results)
+
+        for i in range(start_idx, n):
+            kw_b = kws[i]
+            status_slot.info(f"🔄 [{i+1}/{n}] **{kw_b}** — SERP → Crawl → AI...")
+            r = run_single_for_bulk(
+                kw_b, dfs_login, dfs_password, anthropic_key,
+                location_code, serp_lang, use_jina, t1, t2,
+            )
+            results.append(r)
+            st.session_state.bulk_results = results
+            prog.progress((i + 1) / n)
+
+        st.session_state.bulk_running = False
+        status_slot.empty()
+        st.rerun()
+
+    if st.session_state.bulk_results and not st.session_state.bulk_running:
+        results  = st.session_state.bulk_results
+        done_n   = sum(1 for r in results if r["status"] == "done")
+        fail_n   = len(results) - done_n
+        st.success(f"✅ Hoàn thành **{done_n}/{len(results)}** keywords" +
+                   (f" · {fail_n} lỗi" if fail_n else ""))
+
+        # Status table
+        tbl = pd.DataFrame([{
+            "Keyword":      r["keyword"],
+            "Status":       "✅ done" if r["status"] == "done" else f"❌ {r['status']}",
+            "H2":           len((r.get("outline") or {}).get("outline", [])),
+            "~Words":       r.get("wc_stats", {}).get("target", "—"),
+        } for r in results])
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+        # Export
+        bulk_csv = bulk_to_zimmwriter_csv(results)
+        st.divider()
+        st.markdown("**📊 Export ZimmWriter CSV**")
+        ec1, ec2 = st.columns([1, 1])
+        with ec1:
+            if st.button("💾 Lưu vào output/", key="bulk_save", use_container_width=True):
+                try:
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    out_dir  = os.path.join(base_dir, "output")
+                    os.makedirs(out_dir, exist_ok=True)
+                    fname = f"zimmwriter_bulk_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+                    fp    = os.path.join(out_dir, fname)
+                    with open(fp, "w", newline="", encoding="utf-8-sig") as f:
+                        f.write(bulk_csv)
+                    st.success(f"✅ Đã lưu: `{fp}`")
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+        with ec2:
+            st.download_button(
+                "⬇️ Download ZimmWriter CSV",
+                data=bulk_csv,
+                file_name=f"zimmwriter_bulk_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bulk_dl",
+            )
+        with st.expander("👁️ Preview CSV"):
+            st.code(bulk_csv, language=None)
+
+        if st.button("🗑️ Xoá kết quả", key="bulk_clear"):
+            st.session_state.bulk_results  = []
+            st.session_state.bulk_keywords = []
+            st.rerun()
