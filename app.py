@@ -821,7 +821,7 @@ Instructions:
 5. H3: CHỈ điền nếu competitor thực sự có H3 đó (xem H3 THỰC TẾ bên trên)
 6. Nếu không có H3 từ competitor → dùng bullets (3-6 từ/bullet, 3-5 bullets)
 7. faq = [] (bỏ trống hoàn toàn)
-8. Generate EXACTLY {h2_stats.get('target','6-8') if h2_stats else '6-8'} H2 sections (±1)
+8. Generate EXACTLY {h2_stats.get('target', 7) if h2_stats else 7} H2 sections (±1)
 9. All text in {'Vietnamese' if lang=='vi' else 'English'}
 10. note = ghi "[X/{total_crawled} competitors]" cho mỗi H2
 
@@ -1128,7 +1128,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         _s("🤖 AI generating outline...")
         prompt = build_prompt(kw, serp_lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
-        raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key)
+        raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key, max_tokens=6000)
         data   = parse_json_response(raw)
         errors = validate_outline(data)
         fatal  = [e for e in errors if "Missing" in e or "empty" in e]
