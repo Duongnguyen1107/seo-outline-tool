@@ -1112,6 +1112,10 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         result["serp"] = serp
         _s(f"🕷️ Crawling top {len(serp)} pages...")
 
+        # Auto-detect language giống single mode
+        detected_lang = detect_language(kw)
+        lang = detected_lang if detected_lang else serp_lang
+
         intent_hint  = detect_intent_from_modifier(kw)
         serp_intent  = intent_from_serp_titles(serp)
 
@@ -1126,7 +1130,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         result["h2_stats"] = h2_stats
 
         _s("🤖 AI generating outline...")
-        prompt = build_prompt(kw, serp_lang, intent_hint, serp_intent,
+        prompt = build_prompt(kw, lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
         raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key, max_tokens=6000)
         data   = parse_json_response(raw)
@@ -1173,7 +1177,7 @@ def run_ai_and_validate(system, prompt, key, stream_slot):
             prev = t[-500:].replace("<","&lt;").replace(">","&gt;")
             stream_slot.markdown(f'<div class="stream-box">{prev}</div>',
                                  unsafe_allow_html=True)
-        raw = call_claude_stream(system, prompt, key, on_chunk=on_chunk)
+        raw = call_claude_stream(system, prompt, key, on_chunk=on_chunk, max_tokens=6000)
         stream_slot.empty()
     except ValueError as e:
         stream_slot.empty(); st.error(str(e)); return None, raw
