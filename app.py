@@ -659,7 +659,7 @@ def call_claude_stream(system: str, user: str, key: str,
         with client.stream("POST","https://api.anthropic.com/v1/messages",
             headers={"x-api-key":key,"anthropic-version":"2023-06-01",
                      "content-type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,
+            json={"model":"claude-sonnet-4-6","max_tokens":max_tokens,
                   "stream":True,"system":system,
                   "messages":[{"role":"user","content":user}]},
         ) as resp:
@@ -1161,7 +1161,7 @@ if keyword and not st.session_state.running:
       <span style="color:#94a3b8">signals: {sig}</span>
     </div>""", unsafe_allow_html=True)
 else:
-    eff_lang    = "vi"
+    eff_lang    = serp_lang  # dùng ngôn ngữ của thị trường đã chọn làm fallback
     intent_hint = {"intent":"informational","confidence":"low","signals":[]}
 
 # ═══════════════════════════════════════════════════════════════════
