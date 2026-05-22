@@ -122,12 +122,25 @@ div[data-testid="stExpander"] { border:1px solid #e2e8f0 !important;
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════
 SOCIAL_DOMAINS = {
+    # Social media
     "facebook.com","twitter.com","x.com","instagram.com","tiktok.com",
-    "youtube.com","linkedin.com","pinterest.com","reddit.com","quora.com",
-    "tumblr.com","snapchat.com","threads.net","vk.com","weibo.com",
-    "t.me","telegram.org","wikipedia.org","wikimedia.org",
-    "amazon.com","amazon.co.uk","ebay.com","aliexpress.com",
+    "youtube.com","linkedin.com","pinterest.com","tumblr.com","snapchat.com",
+    "threads.net","vk.com","weibo.com","t.me","telegram.org",
+    # Forums & Q&A
+    "reddit.com","quora.com","stackexchange.com","stackoverflow.com",
+    "answers.com","answers.yahoo.com","houzz.com",
+    # Ecommerce & retail (US)
+    "amazon.com","amazon.co.uk","amazon.com.au","ebay.com","aliexpress.com",
+    "walmart.com","target.com","costco.com","wayfair.com","overstock.com",
+    "homedepot.com","lowes.com","build.com","menards.com",
+    "etsy.com","bestbuy.com","chewy.com",
+    # Ecommerce (VN)
     "shopee.vn","lazada.vn","tiki.vn","sendo.vn",
+    # Review / rating sites
+    "trustpilot.com","yelp.com","tripadvisor.com","bbb.org","sitejabber.com",
+    "g2.com","capterra.com","getapp.com",
+    # Classifieds & aggregators
+    "craigslist.org","offerup.com","facebook.com","nextdoor.com",
 }
 
 BOILERPLATE_PATTERNS = re.compile(
