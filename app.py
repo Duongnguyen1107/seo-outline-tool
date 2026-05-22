@@ -801,10 +801,10 @@ Rules (strictly enforced):
 - Do NOT write creative intro/outro — keep it dense with concrete facts
 - Plain text only, no markdown headers or bullet points
 - If source data is thin, write only what is there and append: "(Limited data from crawl)"
-- CONFLICTING NUMBERS: when multiple sources give different figures for the same fact:
-  1. Use the figure from the highest-ranked source (Rank 1 > Rank 2 > Rank 3 ...)
-  2. If the top-ranked source has no figure for that fact, pick the most specific or most-cited figure from remaining sources
-  Never list conflicting numbers side by side for the same fact.
+- CONFLICTING DATA — a true conflict exists ONLY when two sources state different values for the exact same subject, measurement, and context (e.g., two sources disagree on the drip rate for the same pipe-freeze scenario). Natural variance is NOT a conflict: different tub types having different depths, different methods having different temperatures, ranges vs single values — all are valid and should be preserved as-is.
+  When a true conflict is found:
+  1. Pick ONE value. Priority: Rank 1 > Rank 2 > Rank 3. If Rank 1 has no value for that specific fact, use the most specific or most-cited value from lower-ranked sources.
+  2. Write the chosen value as a single definitive statement. Never write "one source says X, another says Y" or list the conflicting values side by side.
 """
     system = ("Bạn là research assistant. Chỉ trích xuất và cô đọng thông tin thực tế từ "
               "văn bản nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn."
@@ -1193,7 +1193,7 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
     title = data.get("h1") or keyword
     intent = data.get("search_intent_confirmed", "")
     angles = data.get("unique_angles", [])
-    focus_parts = [p for p in [intent] + angles[:3] if p]
+    focus_parts = [p.rstrip(". ") for p in [intent] + angles[:3] if p]
     outline_focus = ". ".join(focus_parts)
     if background_text:
         background = background_text
