@@ -356,7 +356,7 @@ def _dfs_instant_pages(url: str, login: str, password: str,
                 headings.append({"tag": level, "text": text})
         content_meta = meta.get("content", {}) or {}
         wc = content_meta.get("plain_text_word_count", 0) or 0
-        body_text = (content_meta.get("plain_text") or "")[:2500].strip()
+        body_text = (content_meta.get("plain_text") or "").strip()
         return {"headings": headings, "word_count": wc, "body_text": body_text,
                 "status_code": item.get("status_code", 0)}
     except (KeyError, IndexError, TypeError):
@@ -401,7 +401,7 @@ def _dfs_content_parsing(url: str, login: str, password: str) -> dict:
                     text = (block.get("text") or block.get("content") or "").strip()
                     if len(text) > 40:
                         paragraphs.append(text)
-        body_text = " ".join(paragraphs)[:2500]
+        body_text = " ".join(paragraphs)
         wc = pc.get("text_word_count", 0) or 0
         return {"headings": headings, "word_count": wc, "body_text": body_text}
     except (KeyError, IndexError, TypeError):
@@ -466,7 +466,7 @@ def extract_headings_from_markdown(md: str) -> tuple[list[dict], int]:
     wc = len(" ".join(body_lines).split())
     return headings, wc
 
-def _extract_body_from_html(html: str, max_chars: int = 2500) -> str:
+def _extract_body_from_html(html: str, max_chars: int = 0) -> str:
     """Extract paragraph text from HTML — used for layer 3 body_text."""
     soup = BeautifulSoup(html, BS4_PARSER)
     for tag in soup(["script","style","nav","footer","header","aside","noscript","iframe","form"]):
@@ -480,13 +480,15 @@ def _extract_body_from_html(html: str, max_chars: int = 2500) -> str:
     paras = [p.get_text(separator=" ", strip=True)
              for p in (content_el or soup).find_all("p")
              if len(p.get_text(strip=True)) > 40]
-    return " ".join(paras)[:max_chars]
+    text = " ".join(paras)
+    return text[:max_chars] if max_chars else text
 
-def _extract_body_from_jina(md: str, max_chars: int = 2500) -> str:
+def _extract_body_from_jina(md: str, max_chars: int = 0) -> str:
     """Extract non-heading lines from Jina markdown — used for layer 4 body_text."""
     lines = [l.strip() for l in md.splitlines()
              if l.strip() and not l.strip().startswith("#") and len(l.strip()) > 40]
-    return " ".join(lines)[:max_chars]
+    text = " ".join(lines)
+    return text[:max_chars] if max_chars else text
 
 # ── Main crawl_one — 4-layer strategy ────────────────────────────
 def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
@@ -745,13 +747,13 @@ def call_claude_simple(system: str, user: str, key: str,
 
 
 def generate_background_text(keyword: str, lang: str, crawl_results: list,
-                              anthropic_key: str) -> str:
-    """Distill ONLY real facts from competitor body text using Claude Haiku.
-    Never invents content — if no body text crawled, returns a note instead."""
+                              anthropic_key: str, serp_results: list = None) -> str:
+    """Distill ONLY real facts from competitor body text + SERP snippets using Claude Haiku.
+    Never invents content — if no data at all, returns a note instead."""
     if not anthropic_key:
         return ""
 
-    # Collect body_text from top 3 successfully crawled pages
+    # Collect full body_text from top 3 successfully crawled pages
     snippets: list[str] = []
     for r in (crawl_results or []):
         bt = (r.get("body_text") or "").strip()
@@ -760,30 +762,44 @@ def generate_background_text(keyword: str, lang: str, crawl_results: list,
         if len(snippets) >= 3:
             break
 
-    if not snippets:
+    # SERP descriptions — Google-curated summaries, already fetched for free
+    serp_descs: list[str] = []
+    for r in (serp_results or []):
+        desc = (r.get("description") or "").strip()
+        if len(desc) > 30:
+            serp_descs.append(f"- [{domain_of(r.get('url',''))}] {desc}")
+
+    if not snippets and not serp_descs:
         return ("[Không có dữ liệu body text — các trang competitor không crawl được nội dung]"
                 if lang == "vi" else
                 "[No background data available — competitor pages returned no body text]")
 
-    combined  = "\n\n---\n\n".join(snippets)
-    lang_name = "Vietnamese" if lang == "vi" else "English"
+    lang_name    = "Vietnamese" if lang == "vi" else "English"
+    body_section = ("\n\n---\n\n".join(snippets)
+                    if snippets else "(No full body text crawled)")
+    serp_section = ("\n".join(serp_descs)
+                    if serp_descs else "(No SERP descriptions available)")
 
-    prompt = f"""Below is the actual body text crawled from top competitor pages for the topic: "{keyword}"
+    prompt = f"""Below is real data crawled from top competitor pages for the topic: "{keyword}"
 
-{combined}
+== GOOGLE SEARCH SNIPPETS (Google-curated summaries) ==
+{serp_section}
+
+== FULL BODY TEXT FROM TOP COMPETITOR PAGES ==
+{body_section}
 
 ---
 
-Task: Extract and condense ONLY the factual information present in the source text above.
+Task: Extract and condense ONLY the factual information present in the source data above.
 
 Rules (strictly enforced):
 - Write in {lang_name}
 - 400–900 words
-- Include ONLY: facts, statistics, definitions, causes/effects, recommendations — that are explicitly stated in the source text
-- Do NOT add any information not present in the source text above
-- Do NOT write creative intro/outro prose — keep it dense with concrete facts
+- Include ONLY: facts, statistics, definitions, causes/effects, recommendations — explicitly stated in the source
+- Do NOT add any information not present in the sources above
+- Do NOT write creative intro/outro — keep it dense with concrete facts
 - Plain text only, no markdown headers or bullet points
-- If source text is thin or vague, write only what is there and append: "(Limited data from crawl)"
+- If source data is thin, write only what is there and append: "(Limited data from crawl)"
 """
     system = ("Bạn là research assistant. Chỉ trích xuất và cô đọng thông tin thực tế từ "
               "văn bản nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn."
@@ -791,7 +807,7 @@ Rules (strictly enforced):
               "You are a research assistant. Extract and condense factual information "
               "from provided source text only. Never invent or add anything not in the source.")
     try:
-        return call_claude_simple(system, prompt, anthropic_key, max_tokens=900)
+        return call_claude_simple(system, prompt, anthropic_key, max_tokens=1200)
     except Exception:
         return ""
 
@@ -1245,7 +1261,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         prompt = build_prompt(kw, lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
         with ThreadPoolExecutor(max_workers=2) as ex:
-            bg_future  = ex.submit(generate_background_text, kw, lang, crawl, anthropic_key)
+            bg_future  = ex.submit(generate_background_text, kw, lang, crawl, anthropic_key, serp)
             raw_future = ex.submit(call_claude_stream, SYSTEM_PROMPT, prompt, anthropic_key, None, 6000)
             raw = raw_future.result()
             bg  = bg_future.result(timeout=30)
@@ -1585,7 +1601,7 @@ if st.session_state.running and not regen_btn:
         # Step 3: AI outline (Sonnet) + background (Haiku) chạy song song
         # Haiku submit trước, Sonnet stream trên main thread, join sau khi Sonnet xong
         _bg_future = ThreadPoolExecutor(max_workers=1).submit(
-            generate_background_text, kw, eff_lang, crawl, anthropic_key
+            generate_background_text, kw, eff_lang, crawl, anthropic_key, serp
         )
 
         st.markdown("**🤖 Generating outline...**")
