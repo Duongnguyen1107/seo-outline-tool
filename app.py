@@ -842,14 +842,22 @@ QUY TẮC QUAN TRỌNG:
    - bullets là gợi ý ngắn (3-6 từ) về điểm cần cover trong section đó
    - Không được bịa H3 khi đối thủ không có
 
-3. FAQ: KHÔNG tạo FAQ. Để faq=[] rỗng.
+3. TRÙNG NGHĨA — kiểm tra trước khi finalize:
+   - H2 vs H2: nếu 2 H2 cùng chủ đề/ý nghĩa dù khác chữ → merge thành 1, bỏ cái trùng
+   - H3 vs H2 cha: H3 KHÔNG được lặp lại ý của H2 ngay trên nó
+     Ví dụ sai: H2 "Water Resistance" → H3 "Waterproof Properties" (cùng nghĩa → bỏ H3)
+     Ví dụ đúng: H2 "Water Resistance" → H3 "Tile vs Vinyl Waterproofing" (khác góc nhìn → giữ)
+   - H3 vs H3 trong cùng H2: mỗi H3 phải cover 1 khía cạnh khác nhau, không trùng nhau
+   - Nguyên tắc: mỗi heading = 1 góc nhìn/khía cạnh độc lập, không overlap với heading khác
 
-4. NĂM THÁNG: Nếu keyword có năm cũ hoặc không có năm → dùng năm hiện tại trong H1/headings.
+4. FAQ: KHÔNG tạo FAQ. Để faq=[] rỗng.
+
+5. NĂM THÁNG: Nếu keyword có năm cũ hoặc không có năm → dùng năm hiện tại trong H1/headings.
    Không được dùng năm < {CURRENT_YEAR}.
 
-5. SỐ H2: generate đúng target_h2_count (±1).
+6. SỐ H2: generate đúng target_h2_count (±1).
 
-6. NGÔN NGỮ: output = ngôn ngữ của keyword.
+7. NGÔN NGỮ: output = ngôn ngữ của keyword.
 
 JSON schema (tất cả field bắt buộc):
 {{
@@ -949,6 +957,7 @@ Instructions:
 8. Generate EXACTLY {h2_stats.get('target', 7) if h2_stats else 7} H2 sections (±1)
 9. All text in {'Vietnamese' if lang=='vi' else 'English'}
 10. note = ghi "[X/{total_crawled} competitors]" cho mỗi H2
+11. TRÙNG NGHĨA: trước khi output, rà soát toàn bộ outline — mỗi heading (H2 hoặc H3) phải cover 1 góc nhìn độc lập, không trùng nghĩa với bất kỳ heading nào khác dù khác level
 
 Return pure JSON only."""
 
