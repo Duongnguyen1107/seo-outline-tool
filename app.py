@@ -808,8 +808,10 @@ Rules (strictly enforced):
               "from provided source text only. Never invent or add anything not in the source.")
     try:
         raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=1200)
-        # Strip any markdown headers Haiku adds despite instructions
-        clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)
+        # Strip markdown formatting Haiku adds despite instructions
+        clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)  # # headers
+        clean = re.sub(r'^\*\*[^*]+\*\*\s*$', '', clean, flags=re.MULTILINE)  # **bold-only lines**
+        clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', clean)  # inline **bold** → plain
         clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
         return clean
     except Exception:
@@ -835,6 +837,10 @@ QUY TẮC QUAN TRỌNG:
    - Heading [3-4/N]: có thể paraphrase nhẹ
    - Heading [1-2/N] hoặc AI-generated: viết mới hoàn toàn
    - source="competitor" khi lấy từ đối thủ, source="ai" khi tự tạo, source="hybrid" khi kết hợp
+   - LUÔN xóa số thứ tự/prefix của competitor trước khi dùng heading:
+     Ví dụ: "2. Deep Dive: Tub Types" → "Deep Dive: Tub Types"
+             "4 factors that affect..." → "Factors That Affect..."
+             "Step 1: Clean the surface" → giữ nguyên nếu đó là H3 trong how-to, xóa nếu là H2
 
 2. H3:
    - CHỈ đưa vào h3s[] nếu đối thủ thực sự có H3 dưới H2 đó trong data crawl
