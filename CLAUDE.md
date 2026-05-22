@@ -49,7 +49,9 @@ cd /home/diymode/seo-outline-tool && git pull origin main && systemctl restart s
 `dedup_and_weight_headings()` merges headings using 72% string similarity, ranking by frequency. `competitor_h2_stats()` enforces a **minimum target of 5 H2 sections** (`max(avg, med, 5)`). `competitor_word_count_stats()` derives word count constraints.
 
 **Stage 3 — AI Outline Generation**
-`call_claude_stream()` streams from `claude-sonnet-4-6` with `max_tokens=6000`. `build_prompt()` assembles keyword, intent, SERP titles, deduplicated competitor headings with H3 context, word count range, and H2 count target. The H2 fallback target when crawl fails is `7` (integer), not a string.
+`call_claude_stream()` streams from `claude-sonnet-4-6` with `max_tokens=6000`. It calls the Anthropic API directly via raw `httpx` SSE — the `anthropic` SDK is **not** used and not a dependency. `build_prompt()` assembles keyword, intent, SERP titles, deduplicated competitor headings with H3 context (`format_headings_for_prompt()`), word count range, and H2 count target. The H2 fallback target when crawl fails is `7` (integer), not a string.
+
+`validate_outline_data()` checks the JSON response structure; `fix_outline_data()` auto-corrects common issues (clears FAQ, normalizes `source` field, resolves h3s/bullets conflicts — if both are present, h3s wins and bullets is cleared).
 
 Language detection: `detect_language(kw)` auto-detects from keyword characters/words. Both single and bulk modes use auto-detected language — bulk does NOT default to market language.
 
@@ -72,6 +74,7 @@ Both single and bulk export to ZimmWriter Bulk SEO CSV format (Sheet1 layout). C
 | `BOILERPLATE_PATTERNS` | ~line 130 | Regex to strip nav/footer headings |
 | `INTENT_MODIFIERS` | ~line 172 | Keyword patterns for intent detection |
 | `MAX_WORKERS` | ~line 163 | Crawl threads per keyword (=6) |
+| `CRAWL_MAX_MB` | ~line 164 | Max response size per crawled page (=3 MB) |
 | `CURRENT_YEAR` | ~line 701 | Update annually — used in prompt |
 | `SYSTEM_PROMPT` | ~line 703 | Bilingual SEO strategist persona |
 

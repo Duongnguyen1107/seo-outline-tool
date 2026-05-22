@@ -354,8 +354,10 @@ def _dfs_instant_pages(url: str, login: str, password: str,
                 if BOILERPLATE_PATTERNS.match(text):
                     continue
                 headings.append({"tag": level, "text": text})
-        wc = (meta.get("content", {}) or {}).get("plain_text_word_count", 0) or 0
-        return {"headings": headings, "word_count": wc,
+        content_meta = meta.get("content", {}) or {}
+        wc = content_meta.get("plain_text_word_count", 0) or 0
+        body_text = (content_meta.get("plain_text") or "")[:2500].strip()
+        return {"headings": headings, "word_count": wc, "body_text": body_text,
                 "status_code": item.get("status_code", 0)}
     except (KeyError, IndexError, TypeError):
         return {"headings": [], "word_count": 0, "status_code": 0}
@@ -392,10 +394,18 @@ def _dfs_content_parsing(url: str, login: str, password: str) -> dict:
                     level = max(1, min(level, 4))
                     if text and 3 <= len(text) <= 250 and not BOILERPLATE_PATTERNS.match(text):
                         headings.append({"tag": f"h{level}", "text": text})
+        paragraphs = []
+        for section in (pc.get("main_columns") or []):
+            for block in (section.get("content") or []):
+                if block.get("type") == "paragraph":
+                    text = (block.get("text") or block.get("content") or "").strip()
+                    if len(text) > 40:
+                        paragraphs.append(text)
+        body_text = " ".join(paragraphs)[:2500]
         wc = pc.get("text_word_count", 0) or 0
-        return {"headings": headings, "word_count": wc}
+        return {"headings": headings, "word_count": wc, "body_text": body_text}
     except (KeyError, IndexError, TypeError):
-        return {"headings": [], "word_count": 0}
+        return {"headings": [], "word_count": 0, "body_text": ""}
 
 # ── Direct HTTP helpers (free, no API) ───────────────────────────
 def _fetch_html(url: str, timeout: int) -> str:
@@ -456,6 +466,28 @@ def extract_headings_from_markdown(md: str) -> tuple[list[dict], int]:
     wc = len(" ".join(body_lines).split())
     return headings, wc
 
+def _extract_body_from_html(html: str, max_chars: int = 2500) -> str:
+    """Extract paragraph text from HTML — used for layer 3 body_text."""
+    soup = BeautifulSoup(html, BS4_PARSER)
+    for tag in soup(["script","style","nav","footer","header","aside","noscript","iframe","form"]):
+        tag.decompose()
+    content_el = (
+        soup.find("article") or soup.find("main") or
+        soup.find(id=re.compile(r"content|main|post|article", re.I)) or
+        soup.find(class_=re.compile(r"content|main|post|article|entry", re.I)) or
+        soup.body
+    )
+    paras = [p.get_text(separator=" ", strip=True)
+             for p in (content_el or soup).find_all("p")
+             if len(p.get_text(strip=True)) > 40]
+    return " ".join(paras)[:max_chars]
+
+def _extract_body_from_jina(md: str, max_chars: int = 2500) -> str:
+    """Extract non-heading lines from Jina markdown — used for layer 4 body_text."""
+    lines = [l.strip() for l in md.splitlines()
+             if l.strip() and not l.strip().startswith("#") and len(l.strip()) > 40]
+    return " ".join(lines)[:max_chars]
+
 # ── Main crawl_one — 4-layer strategy ────────────────────────────
 def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
               dfs_login: str = "", dfs_password: str = "") -> dict:
@@ -464,7 +496,7 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
     Each layer records its method for display in UI.
     """
     base  = {"url": url, "headings": [], "word_count": 0,
-             "error": None, "method": "direct"}
+             "body_text": "", "error": None, "method": "direct"}
     errors: list[str] = []
 
     # ── Layer 1: DataForSEO instant_pages (JS rendering) ─────────
@@ -492,6 +524,7 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
         headings, wc = extract_headings_from_html(html)
         if headings:
             return {**base, "headings": headings, "word_count": wc,
+                    "body_text": _extract_body_from_html(html),
                     "status": "ok", "method": "direct"}
     except Exception as e:
         errors.append(f"direct1: {str(e)[:60]}")
@@ -502,6 +535,7 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
         headings, wc = extract_headings_from_html(html)
         if headings:
             return {**base, "headings": headings, "word_count": wc,
+                    "body_text": _extract_body_from_html(html),
                     "status": "retry_ok", "method": "direct"}
         errors.append("direct2: empty headings")
     except Exception as e:
@@ -516,6 +550,7 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
                 headings, wc = extract_headings_from_html(md)
             if headings:
                 return {**base, "headings": headings, "word_count": wc,
+                        "body_text": _extract_body_from_jina(md),
                         "status": "jina", "method": "jina"}
             errors.append("jina: no headings")
         except Exception as e:
@@ -689,6 +724,76 @@ def call_claude_stream(system: str, user: str, key: str,
                         continue
     if on_chunk and full: on_chunk(full)
     return full
+
+def call_claude_simple(system: str, user: str, key: str,
+                       model: str = "claude-haiku-4-5-20251001",
+                       max_tokens: int = 800) -> str:
+    """Non-streaming Claude call for short tasks (background generation, etc.)."""
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": model, "max_tokens": max_tokens,
+              "system": system,
+              "messages": [{"role": "user", "content": user}]},
+        timeout=30,
+    )
+    if resp.status_code == 401: raise ValueError("❌ Anthropic: Invalid API key (401).")
+    if resp.status_code == 429: raise ValueError("❌ Anthropic: Rate limit (429).")
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"].strip()
+
+
+def generate_background_text(keyword: str, lang: str, crawl_results: list,
+                              anthropic_key: str) -> str:
+    """Distill ONLY real facts from competitor body text using Claude Haiku.
+    Never invents content — if no body text crawled, returns a note instead."""
+    if not anthropic_key:
+        return ""
+
+    # Collect body_text from top 3 successfully crawled pages
+    snippets: list[str] = []
+    for r in (crawl_results or []):
+        bt = (r.get("body_text") or "").strip()
+        if len(bt) > 100:
+            snippets.append(f"[{domain_of(r.get('url', ''))}]\n{bt}")
+        if len(snippets) >= 3:
+            break
+
+    if not snippets:
+        return ("[Không có dữ liệu body text — các trang competitor không crawl được nội dung]"
+                if lang == "vi" else
+                "[No background data available — competitor pages returned no body text]")
+
+    combined  = "\n\n---\n\n".join(snippets)
+    lang_name = "Vietnamese" if lang == "vi" else "English"
+
+    prompt = f"""Below is the actual body text crawled from top competitor pages for the topic: "{keyword}"
+
+{combined}
+
+---
+
+Task: Extract and condense ONLY the factual information present in the source text above.
+
+Rules (strictly enforced):
+- Write in {lang_name}
+- 400–900 words
+- Include ONLY: facts, statistics, definitions, causes/effects, recommendations — that are explicitly stated in the source text
+- Do NOT add any information not present in the source text above
+- Do NOT write creative intro/outro prose — keep it dense with concrete facts
+- Plain text only, no markdown headers or bullet points
+- If source text is thin or vague, write only what is there and append: "(Limited data from crawl)"
+"""
+    system = ("Bạn là research assistant. Chỉ trích xuất và cô đọng thông tin thực tế từ "
+              "văn bản nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn."
+              if lang == "vi" else
+              "You are a research assistant. Extract and condense factual information "
+              "from provided source text only. Never invent or add anything not in the source.")
+    try:
+        return call_claude_simple(system, prompt, anthropic_key, max_tokens=900)
+    except Exception:
+        return ""
 
 def parse_json_response(raw: str) -> dict:
     clean = re.sub(r"^```[a-z]*\n?","",raw.strip())
@@ -1042,15 +1147,19 @@ ZIMM_HEADERS = [
     "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
 ]
 
-def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list) -> list:
+def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
+                               background_text: str = "") -> list:
     """Build one CSV data row from outline data."""
     title = data.get("h1") or keyword
     intent = data.get("search_intent_confirmed", "")
     angles = data.get("unique_angles", [])
     focus_parts = [p for p in [intent] + angles[:3] if p]
     outline_focus = ". ".join(focus_parts)
-    urls = [r["url"] for r in (serp_results or []) if r.get("url")][:3]
-    background = "\n".join(urls)
+    if background_text:
+        background = background_text
+    else:
+        urls = [r["url"] for r in (serp_results or []) if r.get("url")][:3]
+        background = "\n".join(urls)
     lines = []
     for block in data.get("outline", []):
         h2 = (block.get("h2") or "").strip()
@@ -1063,12 +1172,13 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list) -> 
     slug = _kw_to_slug(keyword)
     return [title, outline_focus, background, outline_text, "", "", slug]
 
-def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list) -> str:
+def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list,
+                               background_text: str = "") -> str:
     """Single-keyword ZimmWriter CSV."""
     buf = io.StringIO()
     w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
     w.writerow(ZIMM_HEADERS)
-    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results))
+    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results, background_text))
     return buf.getvalue()
 
 def bulk_to_zimmwriter_csv(results: list) -> str:
@@ -1079,7 +1189,9 @@ def bulk_to_zimmwriter_csv(results: list) -> str:
     for r in results:
         if r.get("status") != "done" or not r.get("outline"):
             continue
-        w.writerow(_outline_to_zimmwriter_row(r["keyword"], r["outline"], r.get("serp", [])))
+        w.writerow(_outline_to_zimmwriter_row(
+            r["keyword"], r["outline"], r.get("serp", []), r.get("background", "")
+        ))
     return buf.getvalue()
 
 def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
@@ -1140,6 +1252,8 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             result["status"] = "ai_error: " + "; ".join(fatal[:2])
             return result
         result["outline"] = fix_outline_data(data)
+        _s("✍️ Generating background...")
+        result["background"] = generate_background_text(kw, lang, crawl, anthropic_key)
         result["status"]  = "done"
         _s("✅ Done")
     except Exception as e:
@@ -1209,7 +1323,7 @@ SESS_DEFAULTS = {
     "serp":None,"crawl":None,"outline":None,"edited_outline":None,
     "wc_stats":None,"h2_stats":None,"last_kw":None,
     "detected_lang":None,"intent_hint":None,"deduped":None,"serp_intent":None,
-    "kw_history":[],"running":False,"edit_mode":False,
+    "kw_history":[],"running":False,"edit_mode":False,"background_text":"",
     # bulk
     "bulk_running":False,"bulk_keywords":[],"bulk_results":[],"bulk_batch_size":3,
 }
@@ -1465,6 +1579,13 @@ if st.session_state.running and not regen_btn:
                                 f'[{f_}/{tok}]</span> {h["text"]}',
                                 unsafe_allow_html=True)
 
+        # Step 2.5: Background text (Haiku — fast, parallel intent with outline)
+        with st.status("✍️ Generating background context (Haiku)...", expanded=False) as bg_s:
+            bg_text = generate_background_text(kw, eff_lang, crawl, anthropic_key)
+            st.session_state.background_text = bg_text
+            label = "✅ Background context ready" if bg_text else "⚠️ Background skipped (no data)"
+            bg_s.update(label=label, state="complete")
+
         # Step 3: AI
         st.markdown("**🤖 Generating outline...**")
         ss = st.empty()
@@ -1567,7 +1688,10 @@ if st.session_state.outline and not st.session_state.running:
     # ── ZimmWriter CSV Export ─────────────────────────────────────
     st.divider()
     st.markdown("**📊 Export ZimmWriter CSV**")
-    zimm_csv = outline_to_zimmwriter_csv(kw, export_data, st.session_state.serp or [])
+    zimm_csv = outline_to_zimmwriter_csv(
+        kw, export_data, st.session_state.serp or [],
+        st.session_state.get("background_text", "")
+    )
     zc1, zc2 = st.columns([1, 1])
     with zc1:
         if st.button("💾 Lưu vào output/", use_container_width=True,
