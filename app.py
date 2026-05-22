@@ -807,7 +807,11 @@ Rules (strictly enforced):
               "You are a research assistant. Extract and condense factual information "
               "from provided source text only. Never invent or add anything not in the source.")
     try:
-        return call_claude_simple(system, prompt, anthropic_key, max_tokens=1200)
+        raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=1200)
+        # Strip any markdown headers Haiku adds despite instructions
+        clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)
+        clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+        return clean
     except Exception:
         return ""
 
@@ -1730,7 +1734,7 @@ if st.session_state.outline and not st.session_state.running:
     with zc2:
         st.download_button(
             "⬇️ Download ZimmWriter CSV",
-            data=zimm_csv,
+            data=zimm_csv.encode("utf-8-sig"),
             file_name=f"zimmwriter_{_kw_to_slug(kw)}.csv",
             mime="text/csv",
             use_container_width=True,
@@ -1891,7 +1895,7 @@ with tab_bulk:
         with ec2:
             st.download_button(
                 "⬇️ Download ZimmWriter CSV",
-                data=bulk_csv,
+                data=bulk_csv.encode("utf-8-sig"),
                 file_name=f"zimmwriter_bulk_{time.strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True,
