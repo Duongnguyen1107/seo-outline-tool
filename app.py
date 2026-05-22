@@ -1241,20 +1241,23 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         result["wc_stats"] = wc_stats
         result["h2_stats"] = h2_stats
 
-        _s("🤖 AI generating outline...")
+        _s("🤖 AI generating outline + background in parallel...")
         prompt = build_prompt(kw, lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
-        raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key, max_tokens=6000)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            bg_future  = ex.submit(generate_background_text, kw, lang, crawl, anthropic_key)
+            raw_future = ex.submit(call_claude_stream, SYSTEM_PROMPT, prompt, anthropic_key, None, 6000)
+            raw = raw_future.result()
+            bg  = bg_future.result(timeout=30)
         data   = parse_json_response(raw)
         errors = validate_outline(data)
         fatal  = [e for e in errors if "Missing" in e or "empty" in e]
         if fatal:
             result["status"] = "ai_error: " + "; ".join(fatal[:2])
             return result
-        result["outline"] = fix_outline_data(data)
-        _s("✍️ Generating background...")
-        result["background"] = generate_background_text(kw, lang, crawl, anthropic_key)
-        result["status"]  = "done"
+        result["outline"]    = fix_outline_data(data)
+        result["background"] = bg
+        result["status"]     = "done"
         _s("✅ Done")
     except Exception as e:
         result["status"] = f"error: {str(e)[:100]}"
@@ -1579,14 +1582,12 @@ if st.session_state.running and not regen_btn:
                                 f'[{f_}/{tok}]</span> {h["text"]}',
                                 unsafe_allow_html=True)
 
-        # Step 2.5: Background text (Haiku — fast, parallel intent with outline)
-        with st.status("✍️ Generating background context (Haiku)...", expanded=False) as bg_s:
-            bg_text = generate_background_text(kw, eff_lang, crawl, anthropic_key)
-            st.session_state.background_text = bg_text
-            label = "✅ Background context ready" if bg_text else "⚠️ Background skipped (no data)"
-            bg_s.update(label=label, state="complete")
+        # Step 3: AI outline (Sonnet) + background (Haiku) chạy song song
+        # Haiku submit trước, Sonnet stream trên main thread, join sau khi Sonnet xong
+        _bg_future = ThreadPoolExecutor(max_workers=1).submit(
+            generate_background_text, kw, eff_lang, crawl, anthropic_key
+        )
 
-        # Step 3: AI
         st.markdown("**🤖 Generating outline...**")
         ss = st.empty()
         ss.markdown('<div class="stream-box">Connecting to Claude...</div>',
@@ -1598,6 +1599,15 @@ if st.session_state.running and not regen_btn:
         if od:
             st.session_state.outline = od
             st.success("✅ Outline ready!")
+
+        # Thu kết quả Haiku (chắc chắn xong rồi vì Sonnet lâu hơn nhiều)
+        try:
+            bg_text = _bg_future.result(timeout=30)
+        except Exception:
+            bg_text = ""
+        st.session_state.background_text = bg_text
+        label = "✅ Background context ready" if bg_text else "⚠️ Background skipped (no data)"
+        st.caption(f"✍️ {label}")
 
     finally:
         st.session_state.running = False
