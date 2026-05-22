@@ -800,6 +800,7 @@ Rules (strictly enforced):
 - Do NOT write creative intro/outro — keep it dense with concrete facts
 - Plain text only, no markdown headers or bullet points
 - If source data is thin, write only what is there and append: "(Limited data from crawl)"
+- CONFLICTING NUMBERS: when multiple sources give different figures for the same fact, pick ONE (prefer the most specific value or the figure cited most often across sources). Never list conflicting numbers side by side for the same fact.
 """
     system = ("Bạn là research assistant. Chỉ trích xuất và cô đọng thông tin thực tế từ "
               "văn bản nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn."
