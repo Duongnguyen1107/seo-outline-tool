@@ -753,12 +753,13 @@ def generate_background_text(keyword: str, lang: str, crawl_results: list,
     if not anthropic_key:
         return ""
 
-    # Collect full body_text from top 3 successfully crawled pages
+    # Collect full body_text from top 3 successfully crawled pages (rank-ordered)
     snippets: list[str] = []
     for r in (crawl_results or []):
         bt = (r.get("body_text") or "").strip()
         if len(bt) > 100:
-            snippets.append(f"[{domain_of(r.get('url', ''))}]\n{bt}")
+            rank = r.get("rank", "?")
+            snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
         if len(snippets) >= 3:
             break
 
@@ -800,7 +801,10 @@ Rules (strictly enforced):
 - Do NOT write creative intro/outro — keep it dense with concrete facts
 - Plain text only, no markdown headers or bullet points
 - If source data is thin, write only what is there and append: "(Limited data from crawl)"
-- CONFLICTING NUMBERS: when multiple sources give different figures for the same fact, pick ONE (prefer the most specific value or the figure cited most often across sources). Never list conflicting numbers side by side for the same fact.
+- CONFLICTING NUMBERS: when multiple sources give different figures for the same fact:
+  1. Use the figure from the highest-ranked source (Rank 1 > Rank 2 > Rank 3 ...)
+  2. If the top-ranked source has no figure for that fact, pick the most specific or most-cited figure from remaining sources
+  Never list conflicting numbers side by side for the same fact.
 """
     system = ("Bạn là research assistant. Chỉ trích xuất và cô đọng thông tin thực tế từ "
               "văn bản nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn."
