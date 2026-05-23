@@ -155,6 +155,31 @@ BOILERPLATE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Paragraph-level boilerplate: phrases that identify non-content <p> blocks
+# (CTAs, cookie notices, disclosure, author bios, social share prompts, etc.)
+# Applied via search() on short paragraphs (< 200 chars) only to avoid false positives.
+_PARA_BOILERPLATE = re.compile(
+    r"subscribe\s+to\s+(our|the)\b|sign\s+up\s+(for|to\s+get|to\s+receive)\b|"
+    r"join\s+our\s+(newsletter|mailing\s+list)|"
+    r"we\s+use\s+cookies|cookie\s+policy|accept\s+(all\s+)?cookies|"
+    r"privacy\s+policy|terms\s+of\s+(use|service)|"
+    r"affiliate\s+(link|disclosure)|this\s+post\s+may\s+contain\s+affiliate|"
+    r"all\s+rights\s+reserved|copyright\s+©?\s*\d{4}|"
+    r"follow\s+us\s+on\s+(facebook|twitter|instagram|pinterest|tiktok|youtube)|"
+    r"like\s+us\s+on\s+facebook|find\s+us\s+on\s+social|"
+    r"share\s+this\s+(article|post|page|story)|"
+    r"image\s+(credit|source|courtesy)\s*[:—]|photo\s+(credit|by)\s*[:—]|"
+    r"\bsponsored\s+(post|content|by)\b|this\s+is\s+a\s+sponsored|"
+    r"\badd\s+to\s+cart\b|\bbuy\s+now\b|\bshop\s+now\b|\border\s+now\b|"
+    r"filed\s+under\s*[:—]|tagged\s+(with|in)\s*[:—]|"
+    r"leave\s+a\s+(comment|reply)\b|post\s+a\s+comment\b|"
+    r"about\s+the\s+author|written\s+by\s*[:—]|"
+    r"last\s+(updated|modified|reviewed)\s*[:—]\s*\w|"
+    r"bấm\s+vào\s+đây|đăng\s+ký\s+nhận|nhận\s+thông\s+báo|"
+    r"chính\s+sách\s+(bảo\s+mật|cookie)|bản\s+quyền\s+©",
+    re.IGNORECASE,
+)
+
 CRAWL_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -203,6 +228,25 @@ INTENT_MODIFIERS = [
     (r"\bwhy\b","informational",1),(r"\bbenefits\b","informational",1),
     (r"\bexamples\b","informational",1),
 ]
+
+# Fallback H2 targets by intent when competitor heading data is unavailable.
+# Based on typical article structures for each intent type.
+_INTENT_H2_DEFAULTS: dict[str, int] = {
+    "listicle":      8,
+    "how-to":        6,
+    "comparison":    5,
+    "review":        5,
+    "commercial":    5,
+    "transactional": 4,
+    "informational": 6,
+}
+
+def _intent_h2_default(mod_intent: dict, serp_intent: dict) -> int:
+    """Smart H2 fallback when h2_stats unavailable — uses detected intent type."""
+    intent = ((mod_intent or {}).get("intent") or
+              (serp_intent or {}).get("intent") or
+              "informational")
+    return _INTENT_H2_DEFAULTS.get(intent, 6)
 
 INTENT_LABELS = {
     "informational": ("📚 Informational","#dbeafe","#1e40af"),
@@ -490,17 +534,31 @@ def _extract_body_from_html(html: str, max_chars: int = 0) -> str:
         soup.find(class_=re.compile(r"content|main|post|article|entry", re.I)) or
         soup.body
     )
-    paras = [p.get_text(separator=" ", strip=True)
-             for p in (content_el or soup).find_all("p")
-             if len(p.get_text(strip=True)) > 40]
-    text = " ".join(paras)
+    paras = []
+    for p in (content_el or soup).find_all("p"):
+        text = p.get_text(separator=" ", strip=True)
+        if len(text) <= 40:
+            continue
+        # Short paragraphs matching boilerplate signals are CTAs / cookie notices / disclosures
+        if len(text) < 200 and _PARA_BOILERPLATE.search(text):
+            continue
+        paras.append(text)
+    # Preserve paragraph boundaries so _filter_us_friendly can split correctly
+    text = "\n\n".join(paras)
     return text[:max_chars] if max_chars else text
 
 def _extract_body_from_jina(md: str, max_chars: int = 0) -> str:
     """Extract non-heading lines from Jina markdown — used for layer 4 body_text."""
-    lines = [l.strip() for l in md.splitlines()
-             if l.strip() and not l.strip().startswith("#") and len(l.strip()) > 40]
-    text = " ".join(lines)
+    lines = []
+    for l in md.splitlines():
+        l = l.strip()
+        if not l or l.startswith("#") or len(l) <= 40:
+            continue
+        if len(l) < 200 and _PARA_BOILERPLATE.search(l):
+            continue
+        lines.append(l)
+    # Use paragraph separators so _filter_us_friendly can split correctly
+    text = "\n\n".join(lines)
     return text[:max_chars] if max_chars else text
 
 # ── Main crawl_one — 4-layer strategy ────────────────────────────
@@ -515,9 +573,13 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
     errors: list[str] = []
 
     # ── Layer 1: DataForSEO instant_pages (JS rendering) ─────────
+    # body_text_l1 carries over to later layers if headings are missing — prevents
+    # losing rich plain_text when heading parsing fails (e.g. shadow DOM / div headings).
+    body_text_l1 = ""
     if dfs_login and dfs_password:
         try:
             result = _dfs_instant_pages(url, dfs_login, dfs_password, enable_js=True)
+            body_text_l1 = result.get("body_text", "")
             if result["headings"]:
                 return {**base, **result, "status": "dfs", "method": "dfs"}
             errors.append(f"dfs_instant: empty htags (status={result['status_code']})")
@@ -528,6 +590,9 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
         try:
             result2 = _dfs_content_parsing(url, dfs_login, dfs_password)
             if result2["headings"]:
+                # Prefer L2 body_text; fall back to L1 body_text if L2 has none
+                if not result2.get("body_text") and body_text_l1:
+                    result2 = {**result2, "body_text": body_text_l1}
                 return {**base, **result2, "status": "dfs", "method": "dfs_content"}
             errors.append("dfs_content: no headings parsed")
         except Exception as e:
@@ -571,7 +636,9 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
         except Exception as e:
             errors.append(f"jina: {str(e)[:60]}")
 
-    return {**base, "status": "fail", "error": " | ".join(errors[-3:])}
+    # All layers failed to find headings — still surface any body_text from Layer 1
+    # so generate_background_text has something to work with even without structure.
+    return {**base, "body_text": body_text_l1, "status": "fail", "error": " | ".join(errors[-3:])}
 
 def crawl_all(serp_results, t1, t2, use_jina,
               dfs_login="", dfs_password="", on_done=None) -> list[dict]:
@@ -625,24 +692,49 @@ def _similar(a: str, b: str, threshold: float=0.72) -> bool:
     return a==b or SequenceMatcher(None,a,b).ratio()>=threshold
 
 def dedup_and_weight_headings(crawl_results: list[dict]) -> list[dict]:
+    # Phase 1: cluster all headings by tag + text similarity (existing logic)
     all_h: list[tuple] = []
     for r in crawl_results:
         for h in (r.get("headings") or []):
             all_h.append((h["tag"], h["text"], domain_of(r["url"])))
     clusters: list[dict] = []
-    for tag,text,domain in all_h:
+    for tag, text, domain in all_h:
         matched = False
         for c in clusters:
-            if c["tag"]==tag and _similar(c["canonical"],text):
+            if c["tag"] == tag and _similar(c["canonical"], text):
                 if domain not in c["domains"]:
                     c["domains"].append(domain)
                 matched = True; break
         if not matched:
-            clusters.append({"tag":tag,"canonical":text,"domains":[domain]})
-    tag_order = {"h1":0,"h2":1,"h3":2,"h4":3}
+            clusters.append({"tag": tag, "canonical": text, "domains": [domain], "h3s": []})
+
+    # Phase 2: attach H3s to their canonical H2 parent using the same similarity check.
+    # This gives a single source of truth so build_prompt doesn't need a second pass
+    # over raw crawl_results with potentially different heading text.
+    for r in crawl_results:
+        cur_h2_cluster = None
+        for h in (r.get("headings") or []):
+            if h["tag"] == "h2":
+                cur_h2_cluster = None
+                for c in clusters:
+                    if c["tag"] == "h2" and _similar(c["canonical"], h["text"]):
+                        cur_h2_cluster = c
+                        break
+            elif h["tag"] == "h3" and cur_h2_cluster is not None:
+                h3_text = h["text"]
+                if not any(_similar(existing, h3_text) for existing in cur_h2_cluster["h3s"]):
+                    cur_h2_cluster["h3s"].append(h3_text)
+
+    tag_order = {"h1": 0, "h2": 1, "h3": 2, "h4": 3}
     return [
-        {"tag":c["tag"],"text":c["canonical"],"freq":len(c["domains"]),"domains":c["domains"]}
-        for c in sorted(clusters,key=lambda x:(tag_order.get(x["tag"],9),-len(x["domains"])))
+        {
+            "tag": c["tag"],
+            "text": c["canonical"],
+            "freq": len(c["domains"]),
+            "domains": c["domains"],
+            "h3s": c.get("h3s", []),
+        }
+        for c in sorted(clusters, key=lambda x: (tag_order.get(x["tag"], 9), -len(x["domains"])))
     ]
 
 def format_headings_for_prompt(deduped: list[dict], total_crawled: int) -> str:
@@ -782,8 +874,10 @@ def _filter_us_friendly(body_text: str) -> str:
     for para in paragraphs:
         us_hits = len(_US_UNITS.findall(para))
         metric_hits = len(_METRIC_ONLY.findall(para))
-        # Keep if has any US unit OR metric mentions are minimal (passing reference)
-        if us_hits > 0 or metric_hits < 2:
+        # Drop if paragraph has metric units but zero US units — non-US market content.
+        # A single incidental metric mention (metric_hits == 1) with no US unit is still dropped;
+        # previously the threshold was < 2 which let single-metric paragraphs through.
+        if us_hits > 0 or metric_hits == 0:
             kept.append(para)
     return "\n\n".join(kept)
 
@@ -795,13 +889,32 @@ def generate_background_text(keyword: str, lang: str, crawl_results: list,
     if not anthropic_key:
         return ""
 
-    # Collect full body_text from top 3 successfully crawled pages (rank-ordered)
+    # ~2500 words per source keeps the total Haiku prompt under ~10k tokens
+    _BT_CHAR_LIMIT = 15_000
+    # Minimum useful body_text length — below this a source is too thin to help Haiku
+    _BT_MIN_USEFUL = 500
+
+    # Pick top-3 sources: rank-1/2/3 get priority, but if any is too thin we
+    # prefer a lower-ranked page with substantial body_text over a near-empty one.
+    ranked = sorted(
+        [r for r in (crawl_results or []) if len((r.get("body_text") or "")) > 100],
+        key=lambda r: (
+            # Primary: rank order (lower = better); treat missing rank as 999
+            0 if len((r.get("body_text") or "")) >= _BT_MIN_USEFUL else 1,
+            r.get("rank", 999),
+        ),
+    )
+
     snippets: list[str] = []
-    for r in (crawl_results or []):
+    for r in ranked:
         bt = (r.get("body_text") or "").strip()
         if lang == "en":
             bt = _filter_us_friendly(bt)
         if len(bt) > 100:
+            if len(bt) > _BT_CHAR_LIMIT:
+                # Truncate at a paragraph boundary so we don't cut mid-sentence
+                cut = bt.rfind("\n\n", 0, _BT_CHAR_LIMIT)
+                bt = bt[:cut] if cut > 5000 else bt[:_BT_CHAR_LIMIT]
             rank = r.get("rank", "?")
             snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
         if len(snippets) >= 3:
@@ -857,7 +970,7 @@ Rules (strictly enforced):
               "You are a research assistant. Extract and condense factual information "
               "from provided source text only. Never invent or add anything not in the source.")
     try:
-        raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=1200)
+        raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=1800)
         # Strip markdown formatting Haiku adds despite instructions
         clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)  # # headers
         clean = re.sub(r'^\*\*[^*]+\*\*\s*$', '', clean, flags=re.MULTILINE)  # **bold-only lines**
@@ -949,28 +1062,17 @@ def build_prompt(keyword, lang, mod_intent, serp_intent, serp_results,
     total_crawled = sum(1 for r in crawl_results if r.get("headings"))
     headings_block = format_headings_for_prompt(deduped, total_crawled)
 
-    # Build H3 context: which H2s actually have H3s from competitors
-    h2_h3_map: dict[str, list[str]] = {}
-    for r in crawl_results:
-        hs = r.get("headings") or []
-        cur_h2 = None
-        for h in hs:
-            if h["tag"] == "h2":
-                cur_h2 = h["text"]
-                if cur_h2 not in h2_h3_map:
-                    h2_h3_map[cur_h2] = []
-            elif h["tag"] == "h3" and cur_h2:
-                if h["text"] not in h2_h3_map[cur_h2]:
-                    h2_h3_map[cur_h2].append(h["text"])
-
+    # Build H3 context from deduped headings — single source of truth.
+    # H3s were attached to their canonical H2 parent during dedup_and_weight_headings(),
+    # so the text here is consistent with the frequency block above.
     h3_context = ""
-    if h2_h3_map:
+    h2s_with_h3s = [h for h in deduped if h["tag"] == "h2" and h.get("h3s")]
+    if h2s_with_h3s:
         h3_lines = []
-        for h2_text, h3_list in list(h2_h3_map.items())[:20]:  # cap at 20 H2s
-            if h3_list:
-                h3_lines.append(f"  H2: {h2_text}")
-                for h3 in h3_list[:6]:  # cap H3s per H2
-                    h3_lines.append(f"    → H3: {h3}")
+        for h2 in h2s_with_h3s[:20]:  # cap at 20 H2s
+            h3_lines.append(f"  H2: {h2['text']}")
+            for h3 in h2["h3s"][:6]:  # cap H3s per H2
+                h3_lines.append(f"    → H3: {h3}")
         if h3_lines:
             h3_context = "\nH3 THỰC TẾ TỪ COMPETITORS (chỉ những H2 có H3):\n" + "\n".join(h3_lines) + "\n"
 
@@ -978,13 +1080,21 @@ def build_prompt(keyword, lang, mod_intent, serp_intent, serp_results,
     if wc_stats:
         wc_block = (f"Word count: competitor median={wc_stats['median']:,}, "
                     f"target=~{wc_stats['target']:,} words\n")
+    else:
+        wc_block = "Word count: no competitor data — use your judgment for this article type and intent.\n"
 
+    h2_target = h2_stats.get("target") if h2_stats else _intent_h2_default(mod_intent, serp_intent)
     h2_block = ""
     if h2_stats:
         h2_block = (
             f"Competitor H2 count: avg={h2_stats['avg']}, "
             f"median={h2_stats['median']}, range={h2_stats['min']}–{h2_stats['max']}\n"
-            f"TARGET H2 COUNT = {h2_stats['target']} (±1)\n"
+            f"TARGET H2 COUNT = {h2_target} (±1)\n"
+        )
+    else:
+        h2_block = (
+            f"Competitor H2 count: no data (headings could not be parsed from competitor pages).\n"
+            f"TARGET H2 COUNT = {h2_target} (±1) — estimated from article intent type, not competitor data.\n"
         )
 
     return f"""Keyword: "{keyword}"
@@ -1010,7 +1120,7 @@ Instructions:
 5. H3: CHỈ điền nếu competitor thực sự có H3 đó (xem H3 THỰC TẾ bên trên)
 6. Nếu không có H3 từ competitor → dùng bullets (3-6 từ/bullet, 3-5 bullets)
 7. faq = [] (bỏ trống hoàn toàn)
-8. Generate EXACTLY {h2_stats.get('target', 7) if h2_stats else 7} H2 sections (±1)
+8. Generate EXACTLY {h2_target} H2 sections (±1)
 9. All text in {'Vietnamese' if lang=='vi' else 'English'}
 10. note = ghi "[X/{total_crawled} competitors]" cho mỗi H2
 11. TRÙNG NGHĨA: trước khi output, rà soát toàn bộ outline — mỗi heading (H2 hoặc H3) phải cover 1 góc nhìn độc lập, không trùng nghĩa với bất kỳ heading nào khác dù khác level
@@ -1623,6 +1733,16 @@ if st.session_state.running and not regen_btn:
             st.info(f"📊 Competitor H2 count: avg={h2_stats['avg']} · "
                     f"median={h2_stats['median']} · range {h2_stats['min']}–{h2_stats['max']} "
                     f"→ **target: {h2_stats['target']} H2 sections**")
+        else:
+            _fallback_h2 = _intent_h2_default(
+                st.session_state.get("intent_hint", {}),
+                st.session_state.get("serp_intent", {}),
+            )
+            st.warning(
+                f"⚠️ Không parse được heading từ trang đối thủ — "
+                f"H2 target dùng ước tính theo intent: **{_fallback_h2} H2** "
+                f"(không có cơ sở dữ liệu thực tế)."
+            )
 
         with st.expander("🕷️ Crawl details", expanded=False):
             tab1,tab2 = st.tabs(["Per-page","Deduplicated (freq)"])
