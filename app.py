@@ -989,84 +989,48 @@ Rules (strictly enforced):
     except Exception:
         return ""
 
-def generate_section_background(keyword: str, lang: str, crawl_results: list,
-                                anthropic_key: str, outline_data: dict,
-                                serp_results: list = None) -> str:
-    """Generate background text organised by the actual outline H2 sections.
-    Called after Sonnet returns the outline so facts map precisely to each section."""
-    if not anthropic_key or not outline_data:
+def generate_section_background(bg_text: str, outline_data: dict,
+                                anthropic_key: str, lang: str, keyword: str) -> str:
+    """Haiku pass-2: reorganise already-condensed facts (bg_text) by outline H2 sections.
+    Input is small (~400-900 words from pass-1) so Haiku can focus purely on mapping,
+    not on reading raw competitor text again."""
+    if not anthropic_key or not outline_data or not bg_text:
+        return ""
+    # Skip if pass-1 returned a "no data" placeholder
+    if bg_text.startswith("["):
         return ""
     sections = [item.get("h2", "") for item in (outline_data.get("outline") or []) if item.get("h2")]
     if not sections:
         return ""
 
-    _BT_CHAR_LIMIT = 12_000
-    _BT_MIN_USEFUL = 500
-
-    ranked = sorted(
-        [r for r in (crawl_results or []) if len((r.get("body_text") or "")) > 100],
-        key=lambda r: (
-            0 if len((r.get("body_text") or "")) >= _BT_MIN_USEFUL else 1,
-            r.get("rank", 999),
-        ),
-    )
-    snippets: list[str] = []
-    for r in ranked:
-        bt = (r.get("body_text") or "").strip()
-        if lang == "en":
-            bt = _filter_us_friendly(bt)
-        if len(bt) > 100:
-            if len(bt) > _BT_CHAR_LIMIT:
-                cut = bt.rfind("\n\n", 0, _BT_CHAR_LIMIT)
-                bt = bt[:cut] if cut > 5000 else bt[:_BT_CHAR_LIMIT]
-            rank = r.get("rank", "?")
-            snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
-        if len(snippets) >= 5:
-            break
-
-    serp_descs: list[str] = []
-    for r in (serp_results or []):
-        desc = (r.get("description") or "").strip()
-        if len(desc) > 30:
-            serp_descs.append(f"- [{domain_of(r.get('url',''))}] {desc}")
-
-    if not snippets and not serp_descs:
-        return ""
-
     sections_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sections))
-    lang_name    = "Vietnamese" if lang == "vi" else "English"
-    body_section = "\n\n---\n\n".join(snippets) if snippets else "(No full body text crawled)"
-    serp_section = "\n".join(serp_descs) if serp_descs else "(No SERP descriptions available)"
+    lang_name = "Vietnamese" if lang == "vi" else "English"
 
     prompt = f"""Topic: "{keyword}"
 
-The article will have these H2 sections:
+== CONDENSED FACTS FROM COMPETITOR RESEARCH ==
+{bg_text}
+
+== ARTICLE H2 SECTIONS ==
 {sections_list}
-
-== GOOGLE SEARCH SNIPPETS ==
-{serp_section}
-
-== FULL BODY TEXT FROM COMPETITOR PAGES ==
-{body_section}
 
 ---
 
-Task: For EACH H2 section listed above, extract only the relevant factual information from the source data.
+Task: Redistribute the facts above into the relevant H2 sections.
 
 Rules (strictly enforced):
 - Write in {lang_name}
-- For each section: 2–5 sentences of dense, concrete facts. Omit a section label entirely if no relevant data exists in the sources.
-- Include ONLY facts explicitly stated in the sources — no invention, no inference.
-- Plain text within each section — no sub-bullets, no markdown formatting.
-- Format output exactly as: the section title on its own line (no leading #), followed immediately by the facts as a paragraph.
-- US MARKET FOCUS (English only): prioritize imperial units; skip metric-only data points.
-- CONFLICTING DATA: pick Rank 1 value; never list conflicting values side by side.
+- Use ONLY the facts already present in the condensed text above — do NOT add, invent, or infer anything new
+- For each section: 2–4 sentences of the most relevant facts. Omit a section entirely if no relevant facts exist for it.
+- Plain text only — no bullet points, no markdown, no headers with # symbols
+- Format: section title on its own line, immediately followed by the facts paragraph
+- If a fact is relevant to multiple sections, place it in the most specific one only
 """
-    system = ("You are a research assistant. Extract and organise factual information from "
-              "provided source text only, mapped to specific article sections. Never invent content."
+    system = ("You are a research assistant. Reorganise provided facts into article sections. "
+              "Never add information not already present in the input."
               if lang == "en" else
-              "Bạn là research assistant. Trích xuất và sắp xếp thông tin thực tế từ văn bản nguồn "
-              "theo từng section của bài viết. Tuyệt đối không thêm thông tin ngoài nguồn.")
+              "Bạn là research assistant. Sắp xếp lại các facts đã có vào từng section bài viết. "
+              "Tuyệt đối không thêm thông tin ngoài những gì đã có trong input.")
     try:
         raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=2000)
         clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)
@@ -1549,8 +1513,8 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             result["status"] = "ai_error: " + "; ".join(fatal[:2])
             return result
         outline_data = fix_outline_data(data)
-        # Section-aligned background overwrites general background when possible
-        section_bg = generate_section_background(kw, lang, crawl, anthropic_key, outline_data, serp)
+        # Haiku pass-2: reorganise condensed facts by outline sections (input = bg, ~400-900 words)
+        section_bg = generate_section_background(bg, outline_data, anthropic_key, lang, kw)
         result["outline"]    = outline_data
         result["background"] = section_bg if section_bg else bg
         result["status"]     = "done"
@@ -1925,11 +1889,12 @@ if st.session_state.running and not regen_btn:
         except Exception:
             bg_text = ""
 
-        # Section-aligned background: chạy sau khi có outline để map facts → từng H2
-        if od and (crawl or serp):
-            with st.spinner("✍️ Generating section-aligned background..."):
+        # Haiku pass-2: reorganise condensed facts (bg_text) by outline sections.
+        # Input is small (~400-900 words) so this is fast and cheap.
+        if od and bg_text:
+            with st.spinner("✍️ Aligning background to outline sections..."):
                 section_bg = generate_section_background(
-                    kw, eff_lang, crawl, anthropic_key, od, serp
+                    bg_text, od, anthropic_key, eff_lang, kw
                 )
             bg_text = section_bg if section_bg else bg_text
 
@@ -1965,10 +1930,11 @@ elif regen_btn and not st.session_state.running:
         if od:
             st.session_state.outline = od
             st.success("✅ New outline ready!")
-            if crawl_r or serp_r:
-                with st.spinner("✍️ Regenerating section-aligned background..."):
+            existing_bg = st.session_state.get("background_text", "")
+            if existing_bg:
+                with st.spinner("✍️ Re-aligning background to new outline..."):
                     section_bg = generate_section_background(
-                        kw, lang, crawl_r, anthropic_key, od, serp_r
+                        existing_bg, od, anthropic_key, lang, kw
                     )
                 if section_bg:
                     st.session_state.background_text = section_bg
