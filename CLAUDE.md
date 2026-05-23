@@ -33,6 +33,27 @@ cd /home/diymode/seo-outline-tool && git pull origin main && systemctl restart s
 
 **GitHub repo:** `https://github.com/Duongnguyen1107/seo-outline-tool`
 
+## Standard Workflow After Code Changes
+
+After any fix or feature, always: commit → push GitHub → deploy VPS.
+
+```python
+# Deploy via Python paramiko (SSH password auth — no key on this machine)
+import paramiko, sys
+c = paramiko.SSHClient()
+c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+c.connect('82.180.163.187', username='root', password='Duong@11071995', timeout=30)
+_, out, err = c.exec_command(
+    'cd /home/diymode/seo-outline-tool && git pull origin main '
+    '&& systemctl restart seo-outline && systemctl status seo-outline --no-pager'
+)
+sys.stdout.buffer.write(out.read())
+sys.stdout.buffer.write(err.read())
+c.close()
+```
+
+`sshpass` and `plink` are not available on this machine — always use the paramiko snippet above. Commit messages should follow the existing style (imperative, concise subject + body explaining why).
+
 ## Architecture: `app.py` (single file)
 
 ### Pipeline — 4 stages
