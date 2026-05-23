@@ -1516,7 +1516,7 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
         for b in (block.get("bullets") or []):
             b = b.strip()
             if b:
-                lines.append(f"-- {b}{_zimm_tag(b, 'bullet')}")
+                lines.append(f"- {b}{_zimm_tag(b, 'h3')}")
     outline_text = "\n".join(lines)
     slug = _kw_to_slug(keyword)
     return [title, outline_focus, background, outline_text, "", "", slug]
