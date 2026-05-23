@@ -759,6 +759,35 @@ def call_claude_simple(system: str, user: str, key: str,
     return resp.json()["content"][0]["text"].strip()
 
 
+_US_UNITS = re.compile(
+    r'\b(inch(?:es)?|foot|feet|\bft\b|gallon[s]?|\bgal\b|°F|Fahrenheit|'
+    r'pound[s]?|\blbs?\b|\boz\b|ounce[s]?|mile[s]?|mph|quart[s]?|pint[s]?|yard[s]?)\b',
+    re.IGNORECASE
+)
+_METRIC_ONLY = re.compile(
+    r'\b\d+\s*mm\b|\bmillimeters?\b|\bmillimetres?\b|'
+    r'\b\d+\s*cm\b|\bcentimeters?\b|\bcentimetres?\b|'
+    r'\b\d+(?:\.\d+)?\s*m\b|\bmeters?\b|\bmetres?\b|'
+    r'\b\d+\s*kg\b|\bkilograms?\b|\bliters?\b|\blitres?\b|'
+    r'\bkilometers?\b|\bkilometres?\b|\bkm\b',
+    re.IGNORECASE
+)
+
+def _filter_us_friendly(body_text: str) -> str:
+    """Drop paragraphs that contain metric-only measurements with no US imperial equivalent.
+    These are typically non-US market content (Chinese/European product sites) that would
+    produce noise in the background text. Only applied for English-market keywords."""
+    paragraphs = re.split(r'\n{2,}', body_text.strip())
+    kept = []
+    for para in paragraphs:
+        us_hits = len(_US_UNITS.findall(para))
+        metric_hits = len(_METRIC_ONLY.findall(para))
+        # Keep if has any US unit OR metric mentions are minimal (passing reference)
+        if us_hits > 0 or metric_hits < 2:
+            kept.append(para)
+    return "\n\n".join(kept)
+
+
 def generate_background_text(keyword: str, lang: str, crawl_results: list,
                               anthropic_key: str, serp_results: list = None) -> str:
     """Distill ONLY real facts from competitor body text + SERP snippets using Claude Haiku.
@@ -770,6 +799,8 @@ def generate_background_text(keyword: str, lang: str, crawl_results: list,
     snippets: list[str] = []
     for r in (crawl_results or []):
         bt = (r.get("body_text") or "").strip()
+        if lang == "en":
+            bt = _filter_us_friendly(bt)
         if len(bt) > 100:
             rank = r.get("rank", "?")
             snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
@@ -814,6 +845,7 @@ Rules (strictly enforced):
 - Do NOT write creative intro/outro — keep it dense with concrete facts
 - Plain text only, no markdown headers or bullet points
 - If source data is thin, write only what is there and append: "(Limited data from crawl)"
+- US MARKET FOCUS (English only): prioritize data expressed in US imperial units (inches, feet, Fahrenheit, gallons). If a data point uses only metric units (mm, cm, meters, liters, kg) with no imperial equivalent provided, skip it — it is non-US market content and will confuse US readers. When a source provides both metric and imperial, include both but lead with imperial.
 - CONFLICTING DATA — a true conflict exists ONLY when two sources state different values for the exact same subject, measurement, and context (e.g., two sources disagree on the drip rate for the same pipe-freeze scenario). Natural variance is NOT a conflict: different tub types having different depths, different methods having different temperatures, ranges vs single values — all are valid and should be preserved as-is.
   When a true conflict is found:
   1. Pick ONE value. Priority: Rank 1 > Rank 2 > Rank 3. If Rank 1 has no value for that specific fact, use the most specific or most-cited value from lower-ranked sources.

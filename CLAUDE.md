@@ -54,7 +54,7 @@ Two Claude calls run simultaneously via `ThreadPoolExecutor`:
 
 - **Sonnet** (`claude-sonnet-4-6`, `max_tokens=6000`): `call_claude_stream()` streams the SEO outline. Uses raw `httpx` SSE — the `anthropic` SDK is **not** used. `build_prompt()` assembles keyword, intent, SERP titles, deduplicated headings with H3 context, word count range, H2 target, and a semantic dedup instruction (#11).
 
-- **Haiku** (`claude-haiku-4-5-20251001`): `call_claude_simple()` (non-streaming) + `generate_background_text()` distills real facts from competitor `body_text` + SERP `description` fields into 400–900 word background text for ZimmWriter. Strictly no hallucination — returns a note if no body text was crawled. CONFLICTING NUMBERS rule: prefer data from highest SERP rank; if unavailable, pick most specific/most-cited figure. Snippets are labeled `[Rank N: domain]` in the prompt.
+- **Haiku** (`claude-haiku-4-5-20251001`): `call_claude_simple()` (non-streaming) + `generate_background_text()` distills real facts from competitor `body_text` + SERP `description` fields into 400–900 word background text for ZimmWriter. Strictly no hallucination — returns a note if no body text was crawled. Before sending to Haiku, `_filter_us_friendly()` strips metric-only paragraphs (no imperial equivalent) from English crawls to remove non-US market noise. Prompt enforces: CONFLICTING DATA rule (true conflict = same subject+measurement+context, pick Rank 1 value); US MARKET FOCUS rule (imperial first, skip metric-only data points).
 
 Single mode: Haiku runs in background thread while Sonnet streams on main thread. Bulk mode: both submitted to `ThreadPoolExecutor(max_workers=2)` simultaneously.
 
@@ -77,7 +77,9 @@ Paste N keywords (one per line). Configurable parallel batch size (1/2/3/5) via 
 
 | Symbol | Line | Purpose |
 |--------|------|---------|
-| `SOCIAL_DOMAINS` | ~124 | Blacklist filtering SERP results |
+| `SOCIAL_DOMAINS` | ~124 | Blacklist: social, forums, retail, review sites — content-only crawl |
+| `_filter_us_friendly()` | ~776 | Pre-Haiku filter: drops metric-only paragraphs from EN body_text |
+| `_US_UNITS` / `_METRIC_ONLY` | ~762 | Regex patterns used by `_filter_us_friendly()` |
 | `BOILERPLATE_PATTERNS` | ~133 | Regex to strip nav/footer headings |
 | `MAX_WORKERS` | 163 | Crawl threads per keyword (=6) |
 | `CRAWL_MAX_MB` | 164 | Max response size per crawled page (=3 MB) |
@@ -90,6 +92,11 @@ Paste N keywords (one per line). Configurable parallel batch size (1/2/3/5) via 
 - **Rule 1**: H2 frequency thresholds (copy verbatim at 5+/N, paraphrase at 3-4/N, rewrite at 1-2/N). Always strip numbered/lettered prefixes from competitor headings (e.g. `"2. Deep Dive:"` → `"Deep Dive:"`).
 - **Rule 3**: Semantic dedup — H2 vs H2, H3 vs parent H2, H3 vs H3 must each cover distinct angles.
 - **Rule 4**: FAQ always empty.
+
+### Background Generation Rules (Haiku prompt)
+- **CONFLICTING DATA**: true conflict = same subject + measurement + context. Pick Rank 1 value; never list both side by side.
+- **US MARKET FOCUS**: imperial units first; skip metric-only data points (non-US market noise). Only applies to English.
+- **OUTLINE FOCUS field**: parts joined with `". "` — each part must have trailing `.` stripped first (`p.rstrip(". ")`) to avoid double periods.
 
 ### Session State Keys
 Single: `serp`, `crawl`, `outline`, `edited_outline`, `wc_stats`, `h2_stats`, `last_kw`, `detected_lang`, `intent_hint`, `deduped`, `serp_intent`, `kw_history`, `running`, `edit_mode`, `background_text`
