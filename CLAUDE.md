@@ -70,24 +70,27 @@ c.close()
 
 `dedup_and_weight_headings()` merges headings using 72% string similarity. Headings are **rank-weighted**: pages at rank 1–2 contribute 3 pts each, rank 3–5 contribute 2 pts, rank 6+ contribute 1 pt (`_rank_weight()`). Each deduplicated heading carries both `freq` (raw page count) and `weighted_score` (sum of rank weights). Clusters are sorted by `weighted_score` descending so top-ranking pages drive heading order. `competitor_h2_stats()` enforces a **minimum target of 5 H2 sections** (`max(avg, med, 5)`). `competitor_word_count_stats()` derives word count constraints.
 
-**Stage 3 — Parallel AI Calls + Two-Pass Background**
+**Stage 3 — Sequential AI Calls (outline-first, then background)**
 
-Three Claude calls per keyword total:
+Two Claude calls per keyword, always sequential:
 
 - **Sonnet** (`claude-sonnet-4-6`, `max_tokens=6000`): `call_claude_stream()` streams the SEO outline. Uses raw `httpx` SSE — the `anthropic` SDK is **not** used. `build_prompt()` assembles keyword, intent, SERP titles, deduplicated headings with `[freq/N W:score]` notation, H3 context, word count range, H2 target, and W-score threshold instructions.
 
-- **Haiku pass-1** (`claude-haiku-4-5-20251001`): `generate_background_text()` runs in parallel with Sonnet. Reads raw `body_text` from top-3 competitor pages (max 15,000 chars each) + SERP snippets → condenses into 400–900 words of factual background. `_filter_us_friendly()` strips metric-only paragraphs from English crawls before sending. Enforces CONFLICTING DATA rule (pick Rank 1 value) and US MARKET FOCUS (imperial units first).
+- **Haiku** (`claude-haiku-4-5-20251001`): `generate_outline_background()` runs **after** Sonnet finishes. Reads raw `body_text` from top-3 competitor pages (max 15,000 chars each) + SERP snippets **and** the finalized outline H2 section titles in a single call → extracts facts and maps them directly to each H2 section. This outline-aware design eliminates any mismatch between background content and outline sections. `_filter_us_friendly()` strips metric-only paragraphs from English crawls before sending. Omits sections with no relevant data rather than inventing content.
 
-- **Haiku pass-2**: `generate_section_background()` runs **after** Sonnet returns the outline. Takes pass-1 output (~400–900 words, already condensed) + the actual outline H2 section titles → redistributes facts under each H2. Input is ~1,100 words vs the ~7,500 words pass-1 reads, so Haiku focuses purely on mapping rather than extraction. Returns empty string if pass-1 returned a "no data" placeholder (starts with `[`).
-
-Single mode: Haiku pass-1 runs in a background thread while Sonnet streams; pass-2 runs after both are done. Bulk mode: pass-1 and Sonnet run in `ThreadPoolExecutor(max_workers=2)`; pass-2 runs sequentially after.
+Outline is always finalized before background generation starts — both single mode and bulk mode follow this sequential order.
 
 `validate_outline_data()` checks JSON structure; `fix_outline_data()` auto-corrects (clears FAQ, resolves h3s/bullets conflicts — h3s wins).
 
 Language detection: `detect_language(kw)` auto-detects from keyword. Both single and bulk use auto-detected language.
 
 **Stage 4 — ZimmWriter CSV Export**
-`_outline_to_zimmwriter_row()` builds one CSV row. BACKGROUND column uses pass-2 section-aligned text, falls back to pass-1 condensed text, falls back to top 3 competitor URLs. CSV downloads encoded as `utf-8-sig` (BOM) for Excel compatibility. Files saved to `output/` folder.
+`_outline_to_zimmwriter_row(keyword, data, serp_results, background_text, lang)` builds one CSV row. BACKGROUND column uses section-aligned text from Haiku, falls back to top 3 competitor URLs. CSV downloads encoded as `utf-8-sig` (BOM) for Excel compatibility. Files saved to `output/` folder.
+
+ZimmWriter content directives are auto-applied to OUTLINE column based on section title keywords:
+- `{list}`: title contains enumeration keywords (best, top, must, tips, attractions, tốt nhất…)
+- `{table}`: title contains comparison/structured keywords (vs, comparison, types of, specs, so sánh…)
+- H3s and bullets both use `-` prefix; `--` is never emitted (ZimmWriter only accepts `--` under a `-` parent).
 
 ### UI Tabs
 
@@ -123,10 +126,10 @@ After all batches: summary table (Keyword, Lang, Status, Crawl quality, H2, H2 T
 - **Rule 3**: Semantic dedup — H2 vs H2, H3 vs parent H2, H3 vs H3 must each cover distinct angles.
 - **Rule 4**: FAQ always empty.
 
-### Background Generation Rules (Haiku prompts)
-- **Pass-1 CONFLICTING DATA**: true conflict = same subject + measurement + context. Pick Rank 1 value; never list both side by side.
-- **Pass-1 US MARKET FOCUS**: imperial units first; skip metric-only data points (non-US market noise). Only applies to English.
-- **Pass-2**: input is already-condensed facts from pass-1 — must not add, infer, or invent anything beyond what pass-1 produced.
+### Background Generation Rules (Haiku prompt in `generate_outline_background`)
+- **CONFLICTING DATA**: true conflict = same subject + measurement + context. Pick Rank 1 value; never list both side by side.
+- **US MARKET FOCUS**: imperial units first; skip metric-only data points (non-US market noise). Only applies to English.
+- Must not add, infer, or invent anything beyond what the source competitor text contains.
 - **OUTLINE FOCUS field**: parts joined with `". "` — each part must have trailing `.` stripped first (`p.rstrip(". ")`) to avoid double periods.
 
 ### Bulk result dict fields
@@ -148,5 +151,5 @@ Single-file structure is deliberate. Do not refactor into packages.
 
 - **Recommended batch size:** 3 (safe for Claude Tier 1 rate limits)
 - **Max safe batch size on this VPS:** 5 (2 CPU cores, 3.7GB available RAM)
-- **Concurrent load:** batch_size=N means N×6 crawl threads + N×2 Claude calls (Sonnet + Haiku pass-1) simultaneously; Haiku pass-2 runs sequentially after each keyword
-- Each keyword takes ~2–4 min (add ~10–15s for pass-2). Browser must stay open during bulk run.
+- **Concurrent load:** batch_size=N means N×6 crawl threads + N×1 Sonnet call simultaneously; Haiku background runs sequentially after Sonnet per keyword
+- Each keyword takes ~2–4 min (add ~15–20s for Haiku background). Browser must stay open during bulk run.

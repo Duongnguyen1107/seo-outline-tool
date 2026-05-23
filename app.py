@@ -1443,7 +1443,7 @@ def _kw_to_slug(kw: str) -> str:
 
 ZIMM_HEADERS = [
     "ARTICLE TITLE", "OUTLINE FOCUS", "BACKGROUND",
-    "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
+    "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG", "BG QUALITY",
 ]
 
 # Keywords that trigger {list} tag — section enumerates items
@@ -1478,8 +1478,21 @@ def _zimm_tag(text: str, level: str) -> str:
     return ""
 
 
+def _classify_bg_quality(background_text: str, crawl_stats: dict = None) -> str:
+    words = len((background_text or "").split())
+    ok = (crawl_stats or {}).get("ok", 0)
+    total = max((crawl_stats or {}).get("total", 1), 1)
+    ratio = ok / total
+    if words >= 500 and ratio >= 0.4:
+        return "HIGH"
+    if words >= 150:
+        return "MEDIUM"
+    return "LOW"
+
+
 def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
-                               background_text: str = "", lang: str = "en") -> list:
+                               background_text: str = "", lang: str = "en",
+                               crawl_stats: dict = None) -> list:
     """Build one CSV data row from outline data."""
     title = data.get("h1") or keyword
     intent = data.get("search_intent_confirmed", "")
@@ -1506,15 +1519,17 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
                 lines.append(f"- {b}{_zimm_tag(b, 'h3')}")
     outline_text = "\n".join(lines)
     slug = _kw_to_slug(keyword)
-    return [title, outline_focus, background, outline_text, "", "", slug]
+    bg_quality = _classify_bg_quality(background_text, crawl_stats)
+    return [title, outline_focus, background, outline_text, "", "", slug, bg_quality]
 
 def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list,
-                               background_text: str = "", lang: str = "en") -> str:
+                               background_text: str = "", lang: str = "en",
+                               crawl_stats: dict = None) -> str:
     """Single-keyword ZimmWriter CSV."""
     buf = io.StringIO()
     w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
     w.writerow(ZIMM_HEADERS)
-    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results, background_text, lang))
+    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results, background_text, lang, crawl_stats))
     return buf.getvalue()
 
 def bulk_to_zimmwriter_csv(results: list) -> str:
@@ -1527,7 +1542,7 @@ def bulk_to_zimmwriter_csv(results: list) -> str:
             continue
         w.writerow(_outline_to_zimmwriter_row(
             r["keyword"], r["outline"], r.get("serp", []), r.get("background", ""),
-            r.get("lang", "en"),
+            r.get("lang", "en"), r.get("crawl_stats"),
         ))
     return buf.getvalue()
 
@@ -2072,10 +2087,16 @@ if st.session_state.outline and not st.session_state.running:
     # ── ZimmWriter CSV Export ─────────────────────────────────────
     st.divider()
     st.markdown("**📊 Export ZimmWriter CSV**")
+    _crawl_r = st.session_state.crawl or []
+    _crawl_stats = {
+        "ok": sum(1 for r in _crawl_r if r.get("headings")),
+        "total": len(_crawl_r),
+    }
     zimm_csv = outline_to_zimmwriter_csv(
         kw, export_data, st.session_state.serp or [],
         st.session_state.get("background_text", ""),
         st.session_state.get("detected_lang", "en") or "en",
+        _crawl_stats,
     )
     zc1, zc2 = st.columns([1, 1])
     with zc1:
