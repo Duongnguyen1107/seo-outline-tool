@@ -1471,7 +1471,8 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         if on_status: on_status(msg)
 
     result = {"keyword": kw, "status": "error", "outline": None,
-              "serp": [], "wc_stats": {}, "h2_stats": {}}
+              "serp": [], "wc_stats": {}, "h2_stats": {},
+              "crawl_stats": {}, "lang": serp_lang}
     try:
         _s("🔍 Fetching SERP...")
         serp = fetch_serp(kw, dfs_login, dfs_password, location_code, serp_lang)
@@ -1484,6 +1485,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         # Auto-detect language giống single mode
         detected_lang = detect_language(kw)
         lang = detected_lang if detected_lang else serp_lang
+        result["lang"] = lang
 
         intent_hint  = detect_intent_from_modifier(kw)
         serp_intent  = intent_from_serp_titles(serp)
@@ -1497,6 +1499,14 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         deduped  = dedup_and_weight_headings(crawl)
         result["wc_stats"] = wc_stats
         result["h2_stats"] = h2_stats
+        result["crawl_stats"] = {
+            "ok":   sum(1 for r in crawl if r.get("headings")),
+            "total": len(serp),
+            "dfs":  sum(1 for r in crawl if r.get("method") in ("dfs", "dfs_content")),
+            "jina": sum(1 for r in crawl if r.get("method") == "jina"),
+            "fail": sum(1 for r in crawl if r.get("status") == "fail"),
+            "unique_headings": sum(1 for h in deduped if h["tag"] == "h2"),
+        }
 
         _s("🤖 AI generating outline + background in parallel...")
         prompt = build_prompt(kw, lang, intent_hint, serp_intent,
@@ -2104,13 +2114,13 @@ with tab_bulk:
         batches     = [remaining[i:i+bs] for i in range(0, len(remaining), bs)]
         batch_start = done_so_far // bs  # batch number đã xong
 
+        batch_log_slot = st.empty()
         for b_idx, batch in enumerate(batches):
             batch_num  = batch_start + b_idx + 1
             kw_labels  = " · ".join(f"**{k[:30]}**" for k in batch)
             status_slot.info(f"🔄 Batch {batch_num}/{n_batches}: {kw_labels}")
 
             if bs == 1:
-                # Sequential với per-step status
                 def _on_status(msg, _kw=batch[0]):
                     step_slot.caption(f"⏱️ {_kw}: {msg}")
                 batch_results = [run_single_for_bulk(
@@ -2127,12 +2137,23 @@ with tab_bulk:
 
             results.extend(batch_results)
             st.session_state.bulk_results = results
-
-            done_in_batch = sum(1 for r in batch_results if r["status"] == "done")
-            fail_in_batch = len(batch_results) - done_in_batch
-            summary = f"✅ {done_in_batch} done" + (f" · ❌ {fail_in_batch} lỗi" if fail_in_batch else "")
-            step_slot.caption(f"Batch {batch_num}: {summary}")
             prog.progress(len(results) / n)
+
+            # Mini per-keyword summary after batch completes
+            lines = []
+            for r in batch_results:
+                cs = r.get("crawl_stats", {})
+                ok, total = cs.get("ok", 0), cs.get("total", 10)
+                rate = ok / total if total else 0
+                q = "🟢" if rate >= 0.7 else ("🟡" if rate >= 0.4 else "🔴")
+                h2_count = len((r.get("outline") or {}).get("outline", []))
+                wc = r.get("wc_stats", {}).get("target")
+                wc_str = f"~{wc:,}w" if wc else ""
+                if r["status"] == "done":
+                    lines.append(f"✅ **{r['keyword']}** {q} crawl {ok}/{total} · {h2_count} H2 {wc_str}")
+                else:
+                    lines.append(f"❌ **{r['keyword']}**: {r['status']}")
+            step_slot.markdown("  \n".join(lines))
 
         st.session_state.bulk_running = False
         status_slot.empty()
@@ -2146,14 +2167,101 @@ with tab_bulk:
         st.success(f"✅ Hoàn thành **{done_n}/{len(results)}** keywords" +
                    (f" · {fail_n} lỗi" if fail_n else ""))
 
-        # Status table
+        # ── Bảng tổng quan ───────────────────────────────────────────
+        def _cq_label(cs):
+            ok, total = cs.get("ok", 0), cs.get("total", 10)
+            rate = ok / total if total else 0
+            icon = "🟢" if rate >= 0.7 else ("🟡" if rate >= 0.4 else "🔴")
+            return f"{icon} {ok}/{total}"
+
         tbl = pd.DataFrame([{
-            "Keyword":      r["keyword"],
-            "Status":       "✅ done" if r["status"] == "done" else f"❌ {r['status']}",
-            "H2":           len((r.get("outline") or {}).get("outline", [])),
-            "~Words":       r.get("wc_stats", {}).get("target", "—"),
+            "Keyword":    r["keyword"],
+            "Lang":       r.get("lang", "—"),
+            "Status":     "✅" if r["status"] == "done" else f"❌ {r['status']}",
+            "Crawl":      _cq_label(r.get("crawl_stats", {})),
+            "H2":         len((r.get("outline") or {}).get("outline", [])),
+            "H2 Target":  r.get("h2_stats", {}).get("target", "—"),
+            "~Words":     r.get("wc_stats", {}).get("target", "—"),
+            "Background": "✅" if (r.get("background") and not r.get("background","").startswith("[")) else "⚠️",
         } for r in results])
         st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+        # ── Per-keyword expandable detail ─────────────────────────────
+        st.divider()
+        st.markdown("**📋 Chi tiết từng keyword**")
+        for r in results:
+            kw_label = r["keyword"]
+            is_done  = r["status"] == "done"
+            icon     = "✅" if is_done else "❌"
+            with st.expander(f"{icon} {kw_label}", expanded=False):
+                if not is_done:
+                    st.error(f"Lỗi: {r['status']}")
+                    continue
+
+                cs       = r.get("crawl_stats", {})
+                h2_stats = r.get("h2_stats", {})
+                wc_stats = r.get("wc_stats", {})
+                outline  = r.get("outline") or {}
+                bg       = r.get("background", "")
+                lang     = r.get("lang", "")
+
+                # Crawl quality + stats row
+                ok, total = cs.get("ok", 0), cs.get("total", 10)
+                rate = ok / total if total else 0
+                dfs_n  = cs.get("dfs", 0)
+                jina_n = cs.get("jina", 0)
+                fail_n_cs = cs.get("fail", 0)
+                method_parts = []
+                if dfs_n:      method_parts.append(f"🟢 {dfs_n} DFS")
+                if jina_n:     method_parts.append(f"🟣 {jina_n} Jina")
+                if fail_n_cs:  method_parts.append(f"{fail_n_cs} failed")
+                method_str = " · ".join(method_parts)
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    if rate >= 0.7:
+                        st.success(f"🟢 Crawl: {ok}/{total}  {method_str}")
+                    elif rate >= 0.4:
+                        st.warning(f"🟡 Crawl: {ok}/{total}  {method_str}")
+                    else:
+                        st.error(f"🔴 Crawl: {ok}/{total}  {method_str}")
+                with c2:
+                    if h2_stats:
+                        st.info(f"📊 H2: avg {h2_stats['avg']} · median {h2_stats['median']} · target **{h2_stats['target']}**")
+                    else:
+                        st.caption("📊 H2: no data")
+                with c3:
+                    wc_target = wc_stats.get("target")
+                    if wc_target:
+                        st.info(f"📝 Target: ~{wc_target:,} words · Lang: {lang.upper()}")
+                    else:
+                        st.caption(f"📝 Word count: no data · Lang: {lang.upper()}")
+
+                # Outline preview
+                sections = outline.get("outline", [])
+                if sections:
+                    st.markdown(f"**H1:** {outline.get('h1','—')}")
+                    st.caption(f"*{outline.get('meta_description','—')}*")
+                    intent = outline.get("search_intent_confirmed","")
+                    atype  = outline.get("article_type","")
+                    if intent or atype:
+                        st.caption(f"🎯 {atype} · {intent}")
+                    comp_n = sum(1 for s in sections if s.get("source") == "competitor")
+                    ai_n   = sum(1 for s in sections if s.get("source") in ("ai","hybrid"))
+                    st.caption(f"🔵 {comp_n} competitor · 🟢 {ai_n} AI · {len(sections)} H2 total")
+                    for sec in sections:
+                        src_icon = "🔵" if sec.get("source") == "competitor" else ("🟡" if sec.get("source") == "hybrid" else "🟢")
+                        note = sec.get("note","")
+                        st.markdown(f"{src_icon} **{sec.get('h2','')}** `{note}`")
+                        for h3 in (sec.get("h3s") or []):
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;→ {h3}")
+
+                # Background preview
+                if bg and not bg.startswith("["):
+                    with st.expander("📄 Background preview", expanded=False):
+                        st.text(bg[:1000] + ("…" if len(bg) > 1000 else ""))
+                else:
+                    st.caption("⚠️ Background: không có dữ liệu")
 
         # Export
         bulk_csv = bulk_to_zimmwriter_csv(results)
