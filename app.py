@@ -691,22 +691,30 @@ def _similar(a: str, b: str, threshold: float=0.72) -> bool:
     a,b = a.lower().strip(), b.lower().strip()
     return a==b or SequenceMatcher(None,a,b).ratio()>=threshold
 
+def _rank_weight(rank) -> int:
+    """Rank 1-2 = 3pts, rank 3-5 = 2pts, rank 6+ = 1pt."""
+    if rank <= 2: return 3
+    if rank <= 5: return 2
+    return 1
+
 def dedup_and_weight_headings(crawl_results: list[dict]) -> list[dict]:
     # Phase 1: cluster all headings by tag + text similarity (existing logic)
     all_h: list[tuple] = []
     for r in crawl_results:
+        rank = r.get("rank", 999)
         for h in (r.get("headings") or []):
-            all_h.append((h["tag"], h["text"], domain_of(r["url"])))
+            all_h.append((h["tag"], h["text"], domain_of(r["url"]), rank))
     clusters: list[dict] = []
-    for tag, text, domain in all_h:
+    for tag, text, domain, rank in all_h:
         matched = False
         for c in clusters:
             if c["tag"] == tag and _similar(c["canonical"], text):
                 if domain not in c["domains"]:
                     c["domains"].append(domain)
+                    c["ranks"].append(rank)
                 matched = True; break
         if not matched:
-            clusters.append({"tag": tag, "canonical": text, "domains": [domain], "h3s": []})
+            clusters.append({"tag": tag, "canonical": text, "domains": [domain], "ranks": [rank], "h3s": []})
 
     # Phase 2: attach H3s to their canonical H2 parent using the same similarity check.
     # This gives a single source of truth so build_prompt doesn't need a second pass
@@ -731,15 +739,16 @@ def dedup_and_weight_headings(crawl_results: list[dict]) -> list[dict]:
             "tag": c["tag"],
             "text": c["canonical"],
             "freq": len(c["domains"]),
+            "weighted_score": sum(_rank_weight(r) for r in c["ranks"]),
             "domains": c["domains"],
             "h3s": c.get("h3s", []),
         }
-        for c in sorted(clusters, key=lambda x: (tag_order.get(x["tag"], 9), -len(x["domains"])))
+        for c in sorted(clusters, key=lambda x: (tag_order.get(x["tag"], 9), -sum(_rank_weight(r) for r in x["ranks"])))
     ]
 
 def format_headings_for_prompt(deduped: list[dict], total_crawled: int) -> str:
     return "\n".join(
-        f"  [{h['tag'].upper()}] [{h['freq']}/{total_crawled}] {h['text']}"
+        f"  [{h['tag'].upper()}] [{h['freq']}/{total_crawled} W:{h.get('weighted_score', h['freq'])}] {h['text']}"
         for h in deduped
     )
 
@@ -980,6 +989,95 @@ Rules (strictly enforced):
     except Exception:
         return ""
 
+def generate_section_background(keyword: str, lang: str, crawl_results: list,
+                                anthropic_key: str, outline_data: dict,
+                                serp_results: list = None) -> str:
+    """Generate background text organised by the actual outline H2 sections.
+    Called after Sonnet returns the outline so facts map precisely to each section."""
+    if not anthropic_key or not outline_data:
+        return ""
+    sections = [item.get("h2", "") for item in (outline_data.get("outline") or []) if item.get("h2")]
+    if not sections:
+        return ""
+
+    _BT_CHAR_LIMIT = 12_000
+    _BT_MIN_USEFUL = 500
+
+    ranked = sorted(
+        [r for r in (crawl_results or []) if len((r.get("body_text") or "")) > 100],
+        key=lambda r: (
+            0 if len((r.get("body_text") or "")) >= _BT_MIN_USEFUL else 1,
+            r.get("rank", 999),
+        ),
+    )
+    snippets: list[str] = []
+    for r in ranked:
+        bt = (r.get("body_text") or "").strip()
+        if lang == "en":
+            bt = _filter_us_friendly(bt)
+        if len(bt) > 100:
+            if len(bt) > _BT_CHAR_LIMIT:
+                cut = bt.rfind("\n\n", 0, _BT_CHAR_LIMIT)
+                bt = bt[:cut] if cut > 5000 else bt[:_BT_CHAR_LIMIT]
+            rank = r.get("rank", "?")
+            snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
+        if len(snippets) >= 5:
+            break
+
+    serp_descs: list[str] = []
+    for r in (serp_results or []):
+        desc = (r.get("description") or "").strip()
+        if len(desc) > 30:
+            serp_descs.append(f"- [{domain_of(r.get('url',''))}] {desc}")
+
+    if not snippets and not serp_descs:
+        return ""
+
+    sections_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sections))
+    lang_name    = "Vietnamese" if lang == "vi" else "English"
+    body_section = "\n\n---\n\n".join(snippets) if snippets else "(No full body text crawled)"
+    serp_section = "\n".join(serp_descs) if serp_descs else "(No SERP descriptions available)"
+
+    prompt = f"""Topic: "{keyword}"
+
+The article will have these H2 sections:
+{sections_list}
+
+== GOOGLE SEARCH SNIPPETS ==
+{serp_section}
+
+== FULL BODY TEXT FROM COMPETITOR PAGES ==
+{body_section}
+
+---
+
+Task: For EACH H2 section listed above, extract only the relevant factual information from the source data.
+
+Rules (strictly enforced):
+- Write in {lang_name}
+- For each section: 2–5 sentences of dense, concrete facts. Omit a section label entirely if no relevant data exists in the sources.
+- Include ONLY facts explicitly stated in the sources — no invention, no inference.
+- Plain text within each section — no sub-bullets, no markdown formatting.
+- Format output exactly as: the section title on its own line (no leading #), followed immediately by the facts as a paragraph.
+- US MARKET FOCUS (English only): prioritize imperial units; skip metric-only data points.
+- CONFLICTING DATA: pick Rank 1 value; never list conflicting values side by side.
+"""
+    system = ("You are a research assistant. Extract and organise factual information from "
+              "provided source text only, mapped to specific article sections. Never invent content."
+              if lang == "en" else
+              "Bạn là research assistant. Trích xuất và sắp xếp thông tin thực tế từ văn bản nguồn "
+              "theo từng section của bài viết. Tuyệt đối không thêm thông tin ngoài nguồn.")
+    try:
+        raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=2000)
+        clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)
+        clean = re.sub(r'^\*\*[^*]+\*\*\s*$', '', clean, flags=re.MULTILINE)
+        clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', clean)
+        clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+        return clean
+    except Exception:
+        return ""
+
+
 def parse_json_response(raw: str) -> dict:
     clean = re.sub(r"^```[a-z]*\n?","",raw.strip())
     clean = re.sub(r"\n?```$","",clean)
@@ -994,11 +1092,10 @@ SYSTEM_PROMPT = """Bạn là chuyên gia SEO content strategist. Tạo outline b
 
 QUY TẮC QUAN TRỌNG:
 
-1. H2 TEXT:
-   - Heading [5+/N competitors]: GIỮ NGUYÊN text từ đối thủ (không rewrite, không paraphrase).
-     Lý do: nếu nhiều trang top rank cùng dùng 1 heading → đó là heading tốt nhất cho SEO.
-   - Heading [3-4/N]: có thể paraphrase nhẹ
-   - Heading [1-2/N] hoặc AI-generated: viết mới hoàn toàn
+1. H2 TEXT — dùng ngưỡng tần suất [X/N] VÀ weighted score W (rank 1-2=3pts, rank 3-5=2pts, rank 6+=1pt):
+   - [5+/N] HOẶC W≥8: GIỮ NGUYÊN text từ đối thủ (trang quan trọng đồng thuận → heading tốt nhất)
+   - [3-4/N] HOẶC W 4-7: có thể paraphrase nhẹ
+   - [1-2/N] HOẶC W≤3: viết mới hoàn toàn
    - source="competitor" khi lấy từ đối thủ, source="ai" khi tự tạo, source="hybrid" khi kết hợp
    - LUÔN xóa số thứ tự/prefix của competitor trước khi dùng heading:
      Ví dụ: "2. Deep Dive: Tub Types" → "Deep Dive: Tub Types"
@@ -1114,15 +1211,16 @@ COMPETITOR HEADINGS (deduplicated, {total_crawled} pages crawled):
 {h3_context}
 Instructions:
 1. intent → search_intent_confirmed
-2. [5+/{total_crawled}] H2 headings: COPY NGUYÊN TEXT, source="competitor"
-3. [3-4/{total_crawled}] H2: paraphrase nhẹ, source="competitor"
-4. [1-2/{total_crawled}] H2: rewrite hoặc AI gap, source="hybrid"/"ai"
+2. H2 copy nguyên text: [5+/{total_crawled}] HOẶC W≥8 → COPY NGUYÊN TEXT, source="competitor"
+3. H2 paraphrase: [3-4/{total_crawled}] HOẶC W 4–7 → paraphrase nhẹ, source="competitor"
+4. H2 rewrite/AI: [1-2/{total_crawled}] HOẶC W≤3 → viết mới, source="hybrid"/"ai"
+   (W = weighted score: rank 1-2 = 3pts, rank 3-5 = 2pts, rank 6+ = 1pt. W cao = trang quan trọng dùng heading này)
 5. H3: CHỈ điền nếu competitor thực sự có H3 đó (xem H3 THỰC TẾ bên trên)
 6. Nếu không có H3 từ competitor → dùng bullets (3-6 từ/bullet, 3-5 bullets)
 7. faq = [] (bỏ trống hoàn toàn)
 8. Generate EXACTLY {h2_target} H2 sections (±1)
 9. All text in {'Vietnamese' if lang=='vi' else 'English'}
-10. note = ghi "[X/{total_crawled} competitors]" cho mỗi H2
+10. note = ghi "[X/{total_crawled} competitors, W:score]" cho mỗi H2
 11. TRÙNG NGHĨA: trước khi output, rà soát toàn bộ outline — mỗi heading (H2 hoặc H3) phải cover 1 góc nhìn độc lập, không trùng nghĩa với bất kỳ heading nào khác dù khác level
 
 Return pure JSON only."""
@@ -1450,8 +1548,11 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
         if fatal:
             result["status"] = "ai_error: " + "; ".join(fatal[:2])
             return result
-        result["outline"]    = fix_outline_data(data)
-        result["background"] = bg
+        outline_data = fix_outline_data(data)
+        # Section-aligned background overwrites general background when possible
+        section_bg = generate_section_background(kw, lang, crawl, anthropic_key, outline_data, serp)
+        result["outline"]    = outline_data
+        result["background"] = section_bg if section_bg else bg
         result["status"]     = "done"
         _s("✅ Done")
     except Exception as e:
@@ -1729,6 +1830,19 @@ if st.session_state.running and not regen_btn:
             f"{method_str}"
             f" · {len(deduped)} unique headings"
         )
+        crawl_rate = ok_n / len(crawl) if crawl else 0
+        if crawl_rate >= 0.7:
+            st.caption("🟢 **Chất lượng crawl: Tốt** — outline có đủ dữ liệu thực tế từ đối thủ.")
+        elif crawl_rate >= 0.4:
+            st.warning(
+                f"🟡 **Chất lượng crawl: Trung bình** ({ok_n}/{len(crawl)} trang). "
+                "Một số trang chặn crawl — outline kém tin cậy hơn, có thể thiếu heading thực tế."
+            )
+        else:
+            st.error(
+                f"🔴 **Chất lượng crawl: Thấp** ({ok_n}/{len(crawl)} trang). "
+                "Quá ít dữ liệu — outline sẽ phụ thuộc nhiều vào AI tự đoán thay vì dữ liệu đối thủ thực tế."
+            )
         if h2_stats:
             st.info(f"📊 Competitor H2 count: avg={h2_stats['avg']} · "
                     f"median={h2_stats['median']} · range {h2_stats['min']}–{h2_stats['max']} "
@@ -1810,8 +1924,17 @@ if st.session_state.running and not regen_btn:
             bg_text = _bg_future.result(timeout=30)
         except Exception:
             bg_text = ""
+
+        # Section-aligned background: chạy sau khi có outline để map facts → từng H2
+        if od and (crawl or serp):
+            with st.spinner("✍️ Generating section-aligned background..."):
+                section_bg = generate_section_background(
+                    kw, eff_lang, crawl, anthropic_key, od, serp
+                )
+            bg_text = section_bg if section_bg else bg_text
+
         st.session_state.background_text = bg_text
-        label = "✅ Background context ready" if bg_text else "⚠️ Background skipped (no data)"
+        label = "✅ Background (section-aligned) ready" if bg_text else "⚠️ Background skipped (no data)"
         st.caption(f"✍️ {label}")
 
     finally:
@@ -1842,6 +1965,13 @@ elif regen_btn and not st.session_state.running:
         if od:
             st.session_state.outline = od
             st.success("✅ New outline ready!")
+            if crawl_r or serp_r:
+                with st.spinner("✍️ Regenerating section-aligned background..."):
+                    section_bg = generate_section_background(
+                        kw, lang, crawl_r, anthropic_key, od, serp_r
+                    )
+                if section_bg:
+                    st.session_state.background_text = section_bg
     finally:
         st.session_state.running = False
 
