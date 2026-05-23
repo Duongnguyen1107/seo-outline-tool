@@ -1465,7 +1465,7 @@ def save_zimmwriter_to_disk(keyword: str, csv_content: str) -> str:
 def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
                         anthropic_key: str, location_code: int, serp_lang: str,
                         use_jina: bool, t1: int, t2: int,
-                        on_status=None) -> dict:
+                        on_status=None, on_crawl=None) -> dict:
     """Run full pipeline for one keyword. on_status(msg) called at each step."""
     def _s(msg):
         if on_status: on_status(msg)
@@ -1492,6 +1492,7 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
 
         def _on_crawl(done, total, r):
             _s(f"🕷️ Crawling {done}/{total} pages...")
+            if on_crawl: on_crawl(done, total, r)
 
         crawl    = crawl_all(serp, t1, t2, use_jina, dfs_login, dfs_password, _on_crawl)
         wc_stats = competitor_word_count_stats(crawl)
@@ -2114,22 +2115,68 @@ with tab_bulk:
         batches     = [remaining[i:i+bs] for i in range(0, len(remaining), bs)]
         batch_start = done_so_far // bs  # batch number đã xong
 
-        batch_log_slot = st.empty()
         for b_idx, batch in enumerate(batches):
-            batch_num  = batch_start + b_idx + 1
-            kw_labels  = " · ".join(f"**{k[:30]}**" for k in batch)
+            batch_num = batch_start + b_idx + 1
+            kw_labels = " · ".join(f"**{k[:30]}**" for k in batch)
             status_slot.info(f"🔄 Batch {batch_num}/{n_batches}: {kw_labels}")
 
             if bs == 1:
-                def _on_status(msg, _kw=batch[0]):
-                    step_slot.caption(f"⏱️ {_kw}: {msg}")
+                # ── Sequential: hiển thị real-time giống single keyword mode ──
+                kw_now = batch[0]
+                crawl_hdr      = st.empty()
+                crawl_prog_bar = st.empty()
+                crawl_log_slot = st.empty()
+                crawl_log: list[str] = []
+
+                def _on_status_s(msg, _slot=step_slot, _kw=kw_now):
+                    _slot.caption(f"⏱️ **{_kw}:** {msg}")
+
+                def _on_crawl_detail(done, total, r,
+                                     _hdr=crawl_hdr, _pb=crawl_prog_bar,
+                                     _ls=crawl_log_slot, _log=crawl_log,
+                                     _kw=kw_now):
+                    d   = domain_of(r["url"])
+                    wc  = r.get("word_count", 0)
+                    sts = r.get("status", "fail")
+                    mtd = r.get("method", "direct")
+                    mtag = (" 🟢dfs"  if mtd in ("dfs", "dfs_content") else
+                            " 🟣jina" if mtd == "jina" else "")
+                    icon = "✅" if sts in ("ok","dfs","jina") else ("🔁" if sts == "retry_ok" else "❌")
+                    _log.append(f"{icon} **{d}**{f' · {wc:,}w' if wc else ''}{mtag}")
+                    _hdr.markdown(f"**🕷️ Crawling {_kw} — {done}/{total} pages...**")
+                    _pb.progress(done / total)
+                    _ls.markdown("  \n".join(_log[-8:]))
+
                 batch_results = [run_single_for_bulk(
-                    batch[0], dfs_login, dfs_password, anthropic_key,
+                    kw_now, dfs_login, dfs_password, anthropic_key,
                     location_code, serp_lang, use_jina, t1, t2,
-                    on_status=_on_status,
+                    on_status=_on_status_s, on_crawl=_on_crawl_detail,
                 )]
+
+                # Xoá crawl log, hiện crawl quality summary
+                crawl_hdr.empty(); crawl_prog_bar.empty(); crawl_log_slot.empty()
+                r0  = batch_results[0]
+                cs  = r0.get("crawl_stats", {})
+                ok_c, tot_c = cs.get("ok", 0), cs.get("total", 10)
+                rate_c = ok_c / tot_c if tot_c else 0
+                mparts = []
+                if cs.get("dfs"):  mparts.append(f"🟢 {cs['dfs']} DFS")
+                if cs.get("jina"): mparts.append(f"🟣 {cs['jina']} Jina")
+                if cs.get("fail"): mparts.append(f"{cs['fail']} failed")
+                crawl_sum = f"Crawled **{ok_c}/{tot_c}**" + (f" · {' · '.join(mparts)}" if mparts else "")
+                if rate_c >= 0.7:   st.success(f"🟢 {crawl_sum}")
+                elif rate_c >= 0.4: st.warning(f"🟡 {crawl_sum} — một số trang chặn crawl")
+                else:               st.error(f"🔴 {crawl_sum} — ít dữ liệu, outline phụ thuộc AI nhiều")
+                h2s = r0.get("h2_stats", {})
+                if h2s:
+                    st.info(f"📊 H2: avg {h2s['avg']} · median {h2s['median']} · target **{h2s['target']}**")
+
             else:
-                step_slot.caption(f"⏱️ Running {len(batch)} keywords in parallel...")
+                # ── Parallel: không thể real-time per-URL (Streamlit threading limit) ──
+                step_slot.caption(
+                    f"⏱️ Running **{len(batch)}** keywords in parallel "
+                    f"— per-URL crawl log chỉ khả dụng ở batch size 1"
+                )
                 batch_results = run_batch_parallel(
                     batch, dfs_login, dfs_password, anthropic_key,
                     location_code, serp_lang, use_jina, t1, t2,
@@ -2139,21 +2186,22 @@ with tab_bulk:
             st.session_state.bulk_results = results
             prog.progress(len(results) / n)
 
-            # Mini per-keyword summary after batch completes
+            # Mini per-keyword summary sau mỗi batch
             lines = []
             for r in batch_results:
                 cs = r.get("crawl_stats", {})
-                ok, total = cs.get("ok", 0), cs.get("total", 10)
-                rate = ok / total if total else 0
-                q = "🟢" if rate >= 0.7 else ("🟡" if rate >= 0.4 else "🔴")
+                ok_r, tot_r = cs.get("ok", 0), cs.get("total", 10)
+                rate_r = ok_r / tot_r if tot_r else 0
+                q = "🟢" if rate_r >= 0.7 else ("🟡" if rate_r >= 0.4 else "🔴")
                 h2_count = len((r.get("outline") or {}).get("outline", []))
                 wc = r.get("wc_stats", {}).get("target")
                 wc_str = f"~{wc:,}w" if wc else ""
                 if r["status"] == "done":
-                    lines.append(f"✅ **{r['keyword']}** {q} crawl {ok}/{total} · {h2_count} H2 {wc_str}")
+                    lines.append(f"✅ **{r['keyword']}** {q} {ok_r}/{tot_r} · {h2_count} H2 {wc_str}")
                 else:
                     lines.append(f"❌ **{r['keyword']}**: {r['status']}")
-            step_slot.markdown("  \n".join(lines))
+            if bs > 1:
+                step_slot.markdown("  \n".join(lines))
 
         st.session_state.bulk_running = False
         status_slot.empty()
