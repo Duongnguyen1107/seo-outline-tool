@@ -637,7 +637,7 @@ def crawl_one(url: str, t1: int, t2: int, use_jina_fallback: bool,
             errors.append(f"jina: {str(e)[:60]}")
 
     # All layers failed to find headings — still surface any body_text from Layer 1
-    # so generate_background_text has something to work with even without structure.
+    # so generate_outline_background has something to work with even without structure.
     return {**base, "body_text": body_text_l1, "status": "fail", "error": " | ".join(errors[-3:])}
 
 def crawl_all(serp_results, t1, t2, use_jina,
@@ -989,48 +989,90 @@ Rules (strictly enforced):
     except Exception:
         return ""
 
-def generate_section_background(bg_text: str, outline_data: dict,
-                                anthropic_key: str, lang: str, keyword: str) -> str:
-    """Haiku pass-2: reorganise already-condensed facts (bg_text) by outline H2 sections.
-    Input is small (~400-900 words from pass-1) so Haiku can focus purely on mapping,
-    not on reading raw competitor text again."""
-    if not anthropic_key or not outline_data or not bg_text:
+def generate_outline_background(keyword: str, lang: str, crawl_results: list,
+                                outline_data: dict, anthropic_key: str,
+                                serp_results: list = None) -> str:
+    """Single outline-aware Haiku call: extract facts AND map to H2 sections in one pass.
+    Runs after Sonnet outline is finalized so section titles are known — eliminates mismatch."""
+    if not anthropic_key or not outline_data:
         return ""
-    # Skip if pass-1 returned a "no data" placeholder
-    if bg_text.startswith("["):
-        return ""
+
     sections = [item.get("h2", "") for item in (outline_data.get("outline") or []) if item.get("h2")]
     if not sections:
         return ""
 
+    _BT_CHAR_LIMIT = 15_000
+    _BT_MIN_USEFUL = 500
+
+    ranked = sorted(
+        [r for r in (crawl_results or []) if len((r.get("body_text") or "")) > 100],
+        key=lambda r: (
+            0 if len((r.get("body_text") or "")) >= _BT_MIN_USEFUL else 1,
+            r.get("rank", 999),
+        ),
+    )
+
+    snippets: list[str] = []
+    for r in ranked:
+        bt = (r.get("body_text") or "").strip()
+        if lang == "en":
+            bt = _filter_us_friendly(bt)
+        if len(bt) > 100:
+            if len(bt) > _BT_CHAR_LIMIT:
+                cut = bt.rfind("\n\n", 0, _BT_CHAR_LIMIT)
+                bt = bt[:cut] if cut > 5000 else bt[:_BT_CHAR_LIMIT]
+            rank = r.get("rank", "?")
+            snippets.append(f"[Rank {rank}: {domain_of(r.get('url', ''))}]\n{bt}")
+        if len(snippets) >= 3:
+            break
+
+    serp_descs: list[str] = []
+    for r in (serp_results or []):
+        desc = (r.get("description") or "").strip()
+        if len(desc) > 30:
+            serp_descs.append(f"- [{domain_of(r.get('url',''))}] {desc}")
+
+    if not snippets and not serp_descs:
+        return ("[Không có dữ liệu body text — các trang competitor không crawl được nội dung]"
+                if lang == "vi" else
+                "[No background data available — competitor pages returned no body text]")
+
     sections_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sections))
-    lang_name = "Vietnamese" if lang == "vi" else "English"
+    lang_name    = "Vietnamese" if lang == "vi" else "English"
+    body_section = "\n\n---\n\n".join(snippets) if snippets else "(No full body text crawled)"
+    serp_section = "\n".join(serp_descs) if serp_descs else "(No SERP descriptions available)"
 
     prompt = f"""Topic: "{keyword}"
 
-== CONDENSED FACTS FROM COMPETITOR RESEARCH ==
-{bg_text}
-
-== ARTICLE H2 SECTIONS ==
+== ARTICLE H2 SECTIONS (target structure) ==
 {sections_list}
+
+== GOOGLE SEARCH SNIPPETS ==
+{serp_section}
+
+== FULL BODY TEXT FROM TOP COMPETITOR PAGES ==
+{body_section}
 
 ---
 
-Task: Redistribute the facts above into the relevant H2 sections.
+Task: For each H2 section listed above, extract ONLY the directly relevant factual information from the competitor data above and write 2–4 sentences of facts.
 
 Rules (strictly enforced):
 - Write in {lang_name}
-- Use ONLY the facts already present in the condensed text above — do NOT add, invent, or infer anything new
+- Use ONLY facts explicitly present in the source data above — do NOT add, invent, or infer anything new
 - For each section: 2–4 sentences of the most relevant facts. Omit a section entirely if no relevant facts exist for it.
-- Plain text only — no bullet points, no markdown, no headers with # symbols
+- Plain text only — no bullet points, no markdown, no # headers
 - Format: section title on its own line, immediately followed by the facts paragraph
 - If a fact is relevant to multiple sections, place it in the most specific one only
+- US MARKET FOCUS (English only): prioritize data in US imperial units (inches, feet, Fahrenheit, gallons). Skip metric-only data points.
+- CONFLICTING DATA: if two sources disagree on the exact same fact, use the Rank 1 source value and write it as a single definitive statement.
 """
-    system = ("You are a research assistant. Reorganise provided facts into article sections. "
-              "Never add information not already present in the input."
+    system = ("You are a research assistant. For each article section, extract and write only "
+              "the relevant factual information from the provided source text. Never invent or "
+              "add anything not in the source."
               if lang == "en" else
-              "Bạn là research assistant. Sắp xếp lại các facts đã có vào từng section bài viết. "
-              "Tuyệt đối không thêm thông tin ngoài những gì đã có trong input.")
+              "Bạn là research assistant. Với mỗi section bài viết, trích xuất và viết chỉ "
+              "thông tin thực tế liên quan từ nguồn được cung cấp. Tuyệt đối không thêm thông tin ngoài nguồn.")
     try:
         raw = call_claude_simple(system, prompt, anthropic_key, max_tokens=2000)
         clean = re.sub(r'^#{1,6}\s+.*$', '', raw, flags=re.MULTILINE)
@@ -1404,8 +1446,53 @@ ZIMM_HEADERS = [
     "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG",
 ]
 
+# Keywords that trigger {list} tag — section enumerates items
+_ZIMM_LIST_KWS = [
+    "best", "top ", "top-", "must", "tips", "ways to", "reasons", "things to",
+    "places", "options", "ideas", "examples", "benefits", "advantages",
+    "features", "recommendations", "essentials", "picks", "suggestions",
+    "attractions", "activities", "spots", "gems", "highlights", "foods",
+    # VI
+    "tốt nhất", "hàng đầu", "phải", "mẹo", "cách ", "lý do", "địa điểm",
+    "lựa chọn", "ý tưởng", "lợi ích", "ưu điểm", "gợi ý", "kinh nghiệm",
+    "hoạt động", "điểm đến", "món ăn",
+]
+
+# Keywords that trigger {table} tag — comparison / structured data
+_ZIMM_TABLE_KWS = [
+    " vs ", "versus", "comparison", "compare", "difference", "types of",
+    "specifications", "specs", "breakdown", "pros and cons",
+    "cost", "price", "requirements", "overview of",
+    # VI
+    "so sánh", "khác nhau", "loại ", "thông số", "ưu nhược",
+    "chi phí", "giá ", "yêu cầu",
+]
+
+# Keywords that trigger {yt} tag — how-to / instructional content
+_ZIMM_YT_KWS = [
+    "how to", "how do", "how can", "how does", "step by step", "tutorial",
+    "guide to", "learn to", "diy",
+    # VI
+    "hướng dẫn", "cách ", "làm thế nào", "các bước",
+]
+
+
+def _zimm_tag(text: str, level: str) -> str:
+    """Return the ZimmWriter content directive ({yt}/{list}/{table}) for a section."""
+    t = text.lower()
+    # Table takes priority (most specific signal)
+    if any(kw in t for kw in _ZIMM_TABLE_KWS):
+        return "{table}"
+    # yt checked before list — "cách/how to" overlaps with list keywords
+    if any(kw in t for kw in _ZIMM_YT_KWS):
+        return "{yt}"
+    if any(kw in t for kw in _ZIMM_LIST_KWS):
+        return "{list}"
+    return ""
+
+
 def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
-                               background_text: str = "") -> list:
+                               background_text: str = "", lang: str = "en") -> list:
     """Build one CSV data row from outline data."""
     title = data.get("h1") or keyword
     intent = data.get("search_intent_confirmed", "")
@@ -1421,21 +1508,26 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
     for block in data.get("outline", []):
         h2 = (block.get("h2") or "").strip()
         if h2:
-            lines.append(h2)
+            lines.append(f"{h2}{_zimm_tag(h2, 'h2')}")
         for h3 in (block.get("h3s") or []):
-            if h3.strip():
-                lines.append(f"- {h3.strip()}")
+            h3 = h3.strip()
+            if h3:
+                lines.append(f"- {h3}{_zimm_tag(h3, 'h3')}")
+        for b in (block.get("bullets") or []):
+            b = b.strip()
+            if b:
+                lines.append(f"-- {b}{_zimm_tag(b, 'bullet')}")
     outline_text = "\n".join(lines)
     slug = _kw_to_slug(keyword)
     return [title, outline_focus, background, outline_text, "", "", slug]
 
 def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list,
-                               background_text: str = "") -> str:
+                               background_text: str = "", lang: str = "en") -> str:
     """Single-keyword ZimmWriter CSV."""
     buf = io.StringIO()
     w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
     w.writerow(ZIMM_HEADERS)
-    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results, background_text))
+    w.writerow(_outline_to_zimmwriter_row(keyword, data, serp_results, background_text, lang))
     return buf.getvalue()
 
 def bulk_to_zimmwriter_csv(results: list) -> str:
@@ -1447,7 +1539,8 @@ def bulk_to_zimmwriter_csv(results: list) -> str:
         if r.get("status") != "done" or not r.get("outline"):
             continue
         w.writerow(_outline_to_zimmwriter_row(
-            r["keyword"], r["outline"], r.get("serp", []), r.get("background", "")
+            r["keyword"], r["outline"], r.get("serp", []), r.get("background", ""),
+            r.get("lang", "en"),
         ))
     return buf.getvalue()
 
@@ -1509,14 +1602,10 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             "unique_headings": sum(1 for h in deduped if h["tag"] == "h2"),
         }
 
-        _s("🤖 AI generating outline + background in parallel...")
+        _s("🤖 Generating outline...")
         prompt = build_prompt(kw, lang, intent_hint, serp_intent,
                               serp, deduped, crawl, wc_stats, h2_stats)
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            bg_future  = ex.submit(generate_background_text, kw, lang, crawl, anthropic_key, serp)
-            raw_future = ex.submit(call_claude_stream, SYSTEM_PROMPT, prompt, anthropic_key, None, 6000)
-            raw = raw_future.result()
-            bg  = bg_future.result(timeout=30)
+        raw    = call_claude_stream(SYSTEM_PROMPT, prompt, anthropic_key, None, 6000)
         data   = parse_json_response(raw)
         errors = validate_outline(data)
         fatal  = [e for e in errors if "Missing" in e or "empty" in e]
@@ -1524,10 +1613,10 @@ def run_single_for_bulk(kw: str, dfs_login: str, dfs_password: str,
             result["status"] = "ai_error: " + "; ".join(fatal[:2])
             return result
         outline_data = fix_outline_data(data)
-        # Haiku pass-2: reorganise condensed facts by outline sections (input = bg, ~400-900 words)
-        section_bg = generate_section_background(bg, outline_data, anthropic_key, lang, kw)
+        _s("✍️ Generating background per section...")
+        bg = generate_outline_background(kw, lang, crawl, outline_data, anthropic_key, serp)
         result["outline"]    = outline_data
-        result["background"] = section_bg if section_bg else bg
+        result["background"] = bg
         result["status"]     = "done"
         _s("✅ Done")
     except Exception as e:
@@ -1876,12 +1965,7 @@ if st.session_state.running and not regen_btn:
                                 f'[{f_}/{tok}]</span> {h["text"]}',
                                 unsafe_allow_html=True)
 
-        # Step 3: AI outline (Sonnet) + background (Haiku) chạy song song
-        # Haiku submit trước, Sonnet stream trên main thread, join sau khi Sonnet xong
-        _bg_future = ThreadPoolExecutor(max_workers=1).submit(
-            generate_background_text, kw, eff_lang, crawl, anthropic_key, serp
-        )
-
+        # Step 3: AI outline (Sonnet) — background runs AFTER outline is known
         st.markdown("**🤖 Generating outline...**")
         ss = st.empty()
         ss.markdown('<div class="stream-box">Connecting to Claude...</div>',
@@ -1894,20 +1978,13 @@ if st.session_state.running and not regen_btn:
             st.session_state.outline = od
             st.success("✅ Outline ready!")
 
-        # Thu kết quả Haiku (chắc chắn xong rồi vì Sonnet lâu hơn nhiều)
-        try:
-            bg_text = _bg_future.result(timeout=30)
-        except Exception:
-            bg_text = ""
-
-        # Haiku pass-2: reorganise condensed facts (bg_text) by outline sections.
-        # Input is small (~400-900 words) so this is fast and cheap.
-        if od and bg_text:
-            with st.spinner("✍️ Aligning background to outline sections..."):
-                section_bg = generate_section_background(
-                    bg_text, od, anthropic_key, eff_lang, kw
+        # Background: single outline-aware call so facts map exactly to H2 sections
+        bg_text = ""
+        if od:
+            with st.spinner("✍️ Generating background per section..."):
+                bg_text = generate_outline_background(
+                    kw, eff_lang, crawl, od, anthropic_key, serp
                 )
-            bg_text = section_bg if section_bg else bg_text
 
         st.session_state.background_text = bg_text
         label = "✅ Background (section-aligned) ready" if bg_text else "⚠️ Background skipped (no data)"
@@ -1941,14 +2018,12 @@ elif regen_btn and not st.session_state.running:
         if od:
             st.session_state.outline = od
             st.success("✅ New outline ready!")
-            existing_bg = st.session_state.get("background_text", "")
-            if existing_bg:
-                with st.spinner("✍️ Re-aligning background to new outline..."):
-                    section_bg = generate_section_background(
-                        existing_bg, od, anthropic_key, lang, kw
-                    )
-                if section_bg:
-                    st.session_state.background_text = section_bg
+            with st.spinner("✍️ Regenerating background for new outline..."):
+                bg = generate_outline_background(
+                    kw, lang, crawl_r, od, anthropic_key, serp_r
+                )
+            if bg:
+                st.session_state.background_text = bg
     finally:
         st.session_state.running = False
 
@@ -2012,7 +2087,8 @@ if st.session_state.outline and not st.session_state.running:
     st.markdown("**📊 Export ZimmWriter CSV**")
     zimm_csv = outline_to_zimmwriter_csv(
         kw, export_data, st.session_state.serp or [],
-        st.session_state.get("background_text", "")
+        st.session_state.get("background_text", ""),
+        st.session_state.get("detected_lang", "en") or "en",
     )
     zc1, zc2 = st.columns([1, 1])
     with zc1:
