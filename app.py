@@ -128,11 +128,11 @@ SOCIAL_DOMAINS = {
     "threads.net","vk.com","weibo.com","t.me","telegram.org",
     # Forums & Q&A
     "reddit.com","quora.com","stackexchange.com","stackoverflow.com",
-    "answers.com","answers.yahoo.com","houzz.com",
+    "answers.com","answers.yahoo.com",
     # Ecommerce & retail (US)
     "amazon.com","amazon.co.uk","amazon.com.au","ebay.com","aliexpress.com",
-    "walmart.com","target.com","costco.com","wayfair.com","overstock.com",
-    "homedepot.com","lowes.com","build.com","menards.com",
+    "walmart.com","target.com","costco.com","overstock.com",
+    "build.com","menards.com",
     "etsy.com","bestbuy.com","chewy.com",
     # Ecommerce (VN)
     "shopee.vn","lazada.vn","tiki.vn","sendo.vn",
