@@ -1468,24 +1468,11 @@ _ZIMM_TABLE_KWS = [
     "chi phí", "giá ", "yêu cầu",
 ]
 
-# Keywords that trigger {yt} tag — how-to / instructional content
-_ZIMM_YT_KWS = [
-    "how to", "how do", "how can", "how does", "step by step", "tutorial",
-    "guide to", "learn to", "diy",
-    # VI
-    "hướng dẫn", "cách ", "làm thế nào", "các bước",
-]
-
-
 def _zimm_tag(text: str, level: str) -> str:
-    """Return the ZimmWriter content directive ({yt}/{list}/{table}) for a section."""
+    """Return the ZimmWriter content directive ({list}/{table}) for a section."""
     t = text.lower()
-    # Table takes priority (most specific signal)
     if any(kw in t for kw in _ZIMM_TABLE_KWS):
         return "{table}"
-    # yt checked before list — "cách/how to" overlaps with list keywords
-    if any(kw in t for kw in _ZIMM_YT_KWS):
-        return "{yt}"
     if any(kw in t for kw in _ZIMM_LIST_KWS):
         return "{list}"
     return ""
