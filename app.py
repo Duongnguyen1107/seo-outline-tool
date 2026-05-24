@@ -1113,6 +1113,8 @@ QUY TẮC QUAN TRỌNG:
    - Nếu đối thủ KHÔNG có H3 → để h3s=[] và dùng "bullets" để gợi ý nội dung viết gì
    - bullets là gợi ý ngắn (3-6 từ) về điểm cần cover trong section đó
    - Không được bịa H3 khi đối thủ không có
+   - NGƯỠNG TỐI THIỂU: mỗi H2 phải có ÍT NHẤT 2 H3 thì mới dùng h3s[]. Nếu chỉ có 1 H3
+     từ competitor → bỏ vào bullets thay vì h3s[]
 
 3. TRÙNG NGHĨA — kiểm tra trước khi finalize:
    - H2 vs H2: nếu 2 H2 cùng chủ đề/ý nghĩa dù khác chữ → merge thành 1, bỏ cái trùng
@@ -1129,7 +1131,16 @@ QUY TẮC QUAN TRỌNG:
 
 6. SỐ H2: generate đúng target_h2_count (±1).
 
-7. NGÔN NGỮ: output = ngôn ngữ của keyword.
+7. LOẠI TRỪ HEADINGS TỪ REVIEW/ROUNDUP PAGES: Nhiều competitor là trang review sản phẩm
+   (wirecutter, thespruce, consumer reports...). Headings của họ KHÔNG phù hợp với bài
+   informational/how-to dù freq/score cao. Khi article_type là informational, how-to, hoặc
+   comparison: KHÔNG được include H2 chỉ có nghĩa trong context review sản phẩm, ví dụ:
+   - Product picks/awards: "Best Waterproof X", "A Simple Inexpensive X", "Our Top Pick"
+   - Review boilerplate: "Flaws but not dealbreakers", "How we tested", "Also consider",
+     "Runner-up", "Why trust us", "Our verdict", "Editor's choice"
+   Chỉ include H2 structural — giải thích khái niệm, so sánh, hướng dẫn, factors, tips.
+
+8. NGÔN NGỮ: output = ngôn ngữ của keyword.
 
 JSON schema (tất cả field bắt buộc):
 {{
@@ -1443,8 +1454,28 @@ def _kw_to_slug(kw: str) -> str:
 
 ZIMM_HEADERS = [
     "ARTICLE TITLE", "OUTLINE FOCUS", "BACKGROUND",
-    "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG", "BG QUALITY",
+    "OUTLINE", "SEO KEYWORDS", "ONE WORDPRESS CATEGORY", "SLUG", "BG QUALITY", "BG GAPS",
 ]
+
+_NO_DATA_RE = re.compile(
+    r'^no\s+(relevant\s+factual\s+information|specific\s+\S[\S\s]{0,30}\s+instructions?'
+    r'|relevant\s+\S[\S\s]{0,20}\s+information|background data available)',
+    re.IGNORECASE,
+)
+
+def _clean_bg_no_data(text):
+    """Strip 'no data' sections from background; return (cleaned_text, gaps_str)."""
+    if not text:
+        return text, ""
+    blocks = [b.strip() for b in re.split(r'\n{2,}', text.strip())]
+    cleaned, missing = [], []
+    for block in blocks:
+        if _NO_DATA_RE.match(block) or (len(block) < 250 and _NO_DATA_RE.search(block)):
+            if cleaned:
+                missing.append(cleaned.pop())
+        else:
+            cleaned.append(block)
+    return '\n\n'.join(cleaned), '; '.join(missing) if missing else ''
 
 # Keywords that trigger {list} tag — section enumerates items
 _ZIMM_LIST_KWS = [
@@ -1500,10 +1531,11 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
     focus_parts = [p.rstrip(". ") for p in [intent] + angles[:3] if p]
     outline_focus = ". ".join(focus_parts)
     if background_text:
-        background = background_text
+        raw_bg = background_text
     else:
         urls = [r["url"] for r in (serp_results or []) if r.get("url")][:3]
-        background = "\n".join(urls)
+        raw_bg = "\n".join(urls)
+    background, bg_gaps = _clean_bg_no_data(raw_bg)
     lines = []
     for block in data.get("outline", []):
         h2 = (block.get("h2") or "").strip()
@@ -1519,8 +1551,8 @@ def _outline_to_zimmwriter_row(keyword: str, data: dict, serp_results: list,
                 lines.append(f"- {b}{_zimm_tag(b, 'h3')}")
     outline_text = "\n".join(lines)
     slug = _kw_to_slug(keyword)
-    bg_quality = _classify_bg_quality(background_text, crawl_stats)
-    return [title, outline_focus, background, outline_text, "", "", slug, bg_quality]
+    bg_quality = _classify_bg_quality(background, crawl_stats)
+    return [title, outline_focus, background, outline_text, "", "", slug, bg_quality, bg_gaps]
 
 def outline_to_zimmwriter_csv(keyword: str, data: dict, serp_results: list,
                                background_text: str = "", lang: str = "en",
