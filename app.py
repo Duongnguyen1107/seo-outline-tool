@@ -1071,6 +1071,9 @@ Rules (strictly enforced):
   give different values for the same metric, use Rank 1's value only and skip all other values
   for that measurement entirely. Do not write two sentences that state different numbers for the
   same fact.
+- SAME-SOURCE DEDUP: even within a single source, do not repeat near-identical measurements
+  with slight variations (e.g. "22–28 inches" then "23–28 inches" then "24–28 inches" in the
+  same section). Pick the single most specific or most-cited range and state it once only.
 """
     system = ("You are a research assistant. For each article section, extract and write only "
               "the relevant factual information from the provided source text. Never invent or "
