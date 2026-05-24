@@ -865,15 +865,7 @@ Rules (strictly enforced):
 - Plain text only — no bullet points, no markdown, no # headers
 - Format: section title on its own line, immediately followed by the facts paragraph
 - US MARKET FOCUS (English only): prioritize data in US imperial units. Skip metric-only data points.
-- PRIORITY SOURCE: Write primarily from Rank 1. Only pull from Rank 2/3 for facts entirely absent
-  in Rank 1 — never to add a second value for the same measurement already stated by Rank 1.
-- CONFLICTING DATA: each measurement or number must appear EXACTLY ONCE per section. If sources
-  give different values for the same metric, use Rank 1's value only and skip all other values
-  for that measurement entirely. Do not write two sentences that state different numbers for the
-  same fact.
-- SAME-SOURCE DEDUP: even within a single source, do not repeat near-identical measurements
-  with slight variations (e.g. "22–28 inches" then "23–28 inches" then "24–28 inches" in the
-  same section). Pick the single most specific or most-cited range and state it once only.
+- CONFLICTING DATA: if two sources disagree on the exact same fact, use the Rank 1 source value.
 """
     system = ("You are a research assistant. Extract and write only the relevant factual "
               "information from the provided source text. Never invent or add anything not in the source."
